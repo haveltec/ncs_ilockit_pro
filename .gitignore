@@ -1,0 +1,11 @@
+# editors
+*.swp
+*~
+
+# build
+/build*/
+
+# Find-My Token
+/find-my token/
+/DBA01*/
+/EAA01*/
