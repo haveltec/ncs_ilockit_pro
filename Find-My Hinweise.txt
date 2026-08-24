@@ -1,0 +1,53 @@
+
+
+
+Find My
+
+	Sound
+		- Ownder-Sound um Device zu finden
+		- Non-Owner Sound bei Unwanted Tracking
+		
+	Zustände
+		- Connected: Motion und UT deaktiv, Adv. Payload auf Nearby Key setzen
+		- Nearby: Nach Disconnect, Motion und UT deaktiv, Bleibt in Nearby Zustand bis Timeout erreicht, Adv. Payload Nearby Key
+		- Separated: Nach Timeout aus Nearby oder Reboot, Motion und UT ist aktiv, Adv. Payload Primary Key oder Secondary Key
+	
+	Pair before use
+		- Random resolvable addresses und Rotieren der Adressen in den Adv. Sets
+		- Wenn mit Host verbunden, der kein Find-My Pairing besitzt, muss das NEO nur die paired owner information Charakteristik anzeigen
+		- Wenn es mit einem Host für NEO-Funktionen verbunden ist, soll das NEO das Find-My Adertising einstellen
+		
+	Gerätename
+		- Kann unverändert bleiben, da wir kein BLE Pairing nutzen
+		
+	Serial-Number lookup
+		- Physischer Mechanismus um das zu aktiviert
+	
+	Find-My Disabler
+		- Phyischer Mechanismus um Find-My zu deaktivieren
+		
+	Pairing Mode
+		- Physicher Mechanismus um Pairing zu starten
+		
+	Factory Reset
+		- Phyischer Mechanismus um FR herzustellen
+	
+	--- Unwanted Trackimg ---
+	
+	Motion Detector
+		- Muss +-10 Grad Lageänderung in zwei beliebigen Achsen erkennen können
+		
+	Sound maker
+		- Muss Ton abspielen, wenn in Separate State und Bewegung erkannt
+		- Muss Ton abspielen, wenn der Befehl dazu von einem Non-Owner Gerät empfangen wird
+		- Minimum 60 dB
+		
+	Wenn das Neo 3 Tage lang im Separated Zustand war muss das Motion Tracking beginnen mit einer Sampling Rate von 10 Sekunden
+	Wenn keine Bewegung innerhalb dieser Zeit erkannt wurde bleibt das Neo in dem Zustand.
+	Wenn Bewegung erkannt wurde, muss das Neo einen Ton abspielen. Anschließend ist die Samplingrate auf 0,5 Sekunden zu erhöhen 
+	Bei jeder weiteren Bewegung muss wieder ein Ton abgespielt werden. Die Bewegungserkennung soll für eine Zeitspanne von 6 Stunden deaktiviert werden,
+	wenn Bewegung für 20 Sek. bei Samplingrate Tsampling_rate2 erkannt wurde oder 10 Töne abgespielt wurden.
+	Nach dem Timeout muss die Erkennung neu starten.
+	
+	
+	
