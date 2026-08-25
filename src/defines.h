@@ -243,7 +243,7 @@
 #define WDT_OPT WDT_OPT_PAUSE_IN_SLEEP// WDT_OPT_PAUSE_HALTED_BY_DBG gibt es auch noch
 
 ///////// Find-My Advertising-Konfiguration ///////
-#define ILI_NEO_BT_ID   BT_ID_DEFAULT
+#define ILI_PRO_BT_ID   BT_ID_DEFAULT
 #define FMNA_BT_ID      1
 
 #endif // #ifndef DEFINES_H__

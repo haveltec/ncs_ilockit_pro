@@ -44,5 +44,8 @@ target_sources(app PRIVATE ../../libs/ble/ili_client.c)
 target_include_directories(app PRIVATE ../../libs/piezo)
 target_sources(app PRIVATE ../../libs/piezo/ili_piezo.c)
 
+target_include_directories(app PRIVATE ../../libs/led)
+target_sources(app PRIVATE ../../libs/led/ili_led.c)
+
 
 # NORDIC SDK APP END

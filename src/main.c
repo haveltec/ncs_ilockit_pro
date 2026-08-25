@@ -58,6 +58,7 @@
 #include "ili_accelerometer.h"
 #include "ili_client.h"
 #include "ili_piezo.h"
+#include "ili_led.h"
 #include "commands.h"
 #include "defines.h"
 
@@ -252,7 +253,6 @@ static void bond_timeout_handler(struct k_timer *timer);
 static void alarm_restart_timeout_handler(struct k_timer *timer);
 static void reset_prealarm_timeout_handler(struct k_timer *timer);
 static void colorcode_input_timeout_handler(struct k_timer *timer);
-static void led_timeout_handler(struct k_timer *timer);
 static void colorcode_timeout_handler(struct k_timer *timer);
 static void service_code_reset_timeout_handler(struct k_timer *timer);
 static void reset_wrong_colorcode_input_timeout_handler(struct k_timer* timer);
@@ -270,7 +270,7 @@ static void auth_timeout_handler(struct k_timer* timer);
 #define BLE_ADV_CONN_SLOW BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, APP_ADV_INTERVAL_MIN, APP_ADV_INTERVAL_MAX,  \
 			NULL)
 
-static struct bt_le_ext_adv *m_ili_neo_adv_set;
+static struct bt_le_ext_adv *m_ili_pro_adv_set;
 
 static struct ili_service_cb ili_callbacks = {
 	.gdio_data_rx_cb    = app_gdio_data_rx_cb,
@@ -552,7 +552,6 @@ struct k_timer m_bond_timer;
 struct k_timer m_alarm_restart_timer;
 struct k_timer m_reset_prealarm_timer;
 struct k_timer m_colorcode_input_timer;
-struct k_timer m_led_timer;
 struct k_timer m_colorcode_timeout_timer;
 struct k_timer m_service_code_reset_timer;
 struct k_timer m_reset_wrong_colorcode_input_timer;
@@ -573,7 +572,6 @@ static void timers_init()
     k_timer_init(&m_alarm_restart_timer, alarm_restart_timeout_handler, NULL);
     k_timer_init(&m_reset_prealarm_timer, reset_prealarm_timeout_handler, NULL);
     k_timer_init(&m_colorcode_input_timer, colorcode_input_timeout_handler, NULL);
-    k_timer_init(&m_led_timer, led_timeout_handler, NULL);
     k_timer_init(&m_colorcode_timeout_timer, colorcode_timeout_handler, NULL);
     k_timer_init(&m_service_code_reset_timer, service_code_reset_timeout_handler, NULL);
     k_timer_init(&m_reset_wrong_colorcode_input_timer, reset_wrong_colorcode_input_timeout_handler, NULL);
@@ -658,15 +656,15 @@ void start_adv_handler(struct k_work* work)
         int err;
         struct bt_le_ext_adv_start_param ext_adv_start_param = {0};
         
-        err = bt_le_ext_adv_start(m_ili_neo_adv_set, &ext_adv_start_param);
+        err = bt_le_ext_adv_start(m_ili_pro_adv_set, &ext_adv_start_param);
         if (err) {
-            LOG_DBG("Advertising for ILI NEO set failed to start (err %d)", err);
+            LOG_DBG("Advertising for ILI PRO set failed to start (err %d)", err);
             // Nach 5 Sekunden erneut versuchen das Advertisment zu starten
             k_work_schedule(&work_start_advertising, K_SECONDS(5));
         }
         else
         {
-            LOG_DBG("ILI NEO advertising successfully started");
+            LOG_DBG("ILI PRO advertising successfully started");
             m_advertising_is_active = true;
         }
     }
@@ -995,15 +993,6 @@ void colorcode_timeout_handler(struct k_timer *timer)
 }
 
 
-/** @brief LEDs deaktivieren, wenn Timer abgelaufen
-*/
-static void led_timeout_handler(struct k_timer *timer)
-{
-    LOG_DBG("led_timeout_handler");
-    if(m_button_counter == 0)
-        led_off();
-}
-
 
 /** @brief Timeout zum setzen des Flags, das das Stoppen des Motors per Knopfdruck freigibt
 */
@@ -1224,179 +1213,107 @@ static void new_bond()
 }
 
 
+/**@brief Zuordnung der Anzeigemuster zu den Einstellungen des LED-Treibers
+ *
+ * mode         - Muster, mit dem die LED angesteuert wird
+ * brightness   - maximale Helligkeit in Prozent
+ * period_ms    - Geschwindigkeit: Dauer eines kompletten Fade-Zyklus
+ * duration_ms  - Dauer, die led_timed() die Anzeige laufen laesst (0 = endlos)
+ */
+typedef struct
+{
+    ili_led_mode_t  mode;
+    uint8_t         brightness;
+    uint16_t        period_ms;
+    uint32_t        duration_ms;
+} led_pattern_t;
+
+static const led_pattern_t m_led_patterns[] =
+{
+    [LED_STATIC]     = { ILI_LED_MODE_STATIC,   50, 1000,  5000 },  // FIVE_SEC_TIMEOUT_INTERVAL
+    [LED_ERROR]      = { ILI_LED_MODE_BLINK,    60,  200,  1000 },  // ONE_SEC_TIMEOUT_INTERVAL
+    [LED_DISCONNECT] = { ILI_LED_MODE_BLINK,    60,  200,  1000 },  // ONE_SEC_TIMEOUT_INTERVAL
+    [LED_BONDING]    = { ILI_LED_MODE_BREATHE,  40, 1500, 90000 },  // BOND_TIMEOUT_INTERVAL
+    [LED_LOCKING]    = { ILI_LED_MODE_PULSE,    40,  800, 15000 },  // MOTOR_TIMEOUT_INTERVAL
+    [LED_UNLOCKING]  = { ILI_LED_MODE_PULSE,    40,  800, 15000 },  // MOTOR_TIMEOUT_INTERVAL
+    [LED_CHARGING]   = { ILI_LED_MODE_BREATHE,  40, 3000,     0 },  // laeuft bis zum Ende des Ladevorgangs
+    [LED_ALARM]      = { ILI_LED_MODE_BLINK,    80,  250, 30000 },  // THIRTY_SEC_TIMEOUT_INTERVAL
+    [LED_DOUBLE_TAP] = { ILI_LED_MODE_STATIC,   50, 1000,   500 },  // DOUBLE_TAP_TIMEOUT_INTERVAL
+    [LED_SIGNAL]     = { ILI_LED_MODE_BLINK,    80,  400, 10000 },  // TEN_SEC_TIMEOUT_INTERVAL
+};
+
+
+/**@brief Anzeige beenden
+ *
+ * Waehrend des Ladevorgangs wird stattdessen die Ladeanzeige gestartet.
+ */
 void led_off()
 {
-//    k_timer_stop(&m_led_timer);
+    LOG_DBG("led_off");
 
-//    if(m_charge_active)
-//        led_faded(LED_R, LED_CHARGING);
-//    else
-        //ili_led_strip_stop();
+    if(m_charge_active)
+        led_faded(LED_R, LED_CHARGING);
+    else
+        ili_led_stop();
 }
 
 
+/**@brief LEDs dauerhaft aktivieren
+ */
 void led(uint8_t color)
 {
-  //  led_faded(color, LED_STATIC);
+    led_faded(color, LED_STATIC);
 }
 
 
-/**@brief // Funktion zum Faden der LEDs
+/**@brief Funktion zum Faden der LEDs
+ *
+ * Die Anzeige laeuft, bis sie mit led_off() beendet wird.
  */
 void led_faded(uint8_t color, led_fading_t fading_type)
 {
     LOG_DBG("led_faded");
 
-/*    // Timer stoppen
-    k_timer_stop(&m_led_timer);
+    if((size_t)fading_type >= ARRAY_SIZE(m_led_patterns))
+        return;
 
-    ili_led_strip_set_prim_color(color);
+    const led_pattern_t* p_pattern = &m_led_patterns[fading_type];
 
-    switch(fading_type)
-    {
-        case LED_DISCONNECT:
-        case LED_ERROR:
-        {
-           ili_led_strip_set_effect(1);
-           ili_led_strip_set_brightness(150);
-           ill_led_strip_set_speed(120);
-        }
-        break;
-        
-        case LED_BONDING:
-        {
-            ili_led_strip_set_effect(1);
-            ili_led_strip_set_brightness(100);
-            ill_led_strip_set_speed(20);
-        }
-        break;
-        
-        case LED_LOCKING:
-        {
+    ili_led_config_t config = {
+        .color       = color,
+        .mode        = p_pattern->mode,
+        .brightness  = p_pattern->brightness,
+        .period_ms   = p_pattern->period_ms,
+        .duration_ms = 0
+    };
 
-            ili_led_strip_set_direction(ILI_LED_STRIP_DIR_FORWARD);
-            ili_led_strip_set_effect(0);
-            ili_led_strip_set_brightness(100);
-            ill_led_strip_set_speed(1);
-        }
-        break;
-
-        case LED_UNLOCKING:
-        {
-            ili_led_strip_set_direction(ILI_LED_STRIP_DIR_BACKWARD);
-            ili_led_strip_set_effect(0);
-            ili_led_strip_set_brightness(100);
-            ill_led_strip_set_speed(1);
-        }
-        break;
-        
-        case LED_CHARGING:
-        {
-            ili_led_strip_set_effect(1);
-            ili_led_strip_set_brightness(100);
-            ill_led_strip_set_speed(5);
-        }
-        break;
-        
-        case LED_ALARM:
-        {
-            ili_led_strip_set_effect(1);
-            ili_led_strip_set_brightness(200);
-            ill_led_strip_set_speed(75);
-        }
-        break;
-
-        case LED_DOUBLE_TAP:
-        case LED_STATIC:
-        {
-            ili_led_strip_set_effect(4);
-            ili_led_strip_set_brightness(120);
-        }
-        break;
-
-        case LED_SIGNAL:
-        {
-            ili_led_strip_set_effect(3);
-            ili_led_strip_set_brightness(200);
-            ill_led_strip_set_speed(75);
-        }
-        break;
-
-        default:
-        {
-
-        }
-        break;
-    }
-
-    // LED-Thread fürs Fading erstellen und laufen lassen
-    ili_led_strip_start();
-    */
+    ili_led_start(&config);
 }
 
 
-/**
- * @brief Zeitlich begrenztes Aktivieren der LED
+/**@brief Zeitlich begrenztes Aktivieren der LED
+ *
+ * Die Dauer ist im Anzeigemuster hinterlegt und wird vom LED-Treiber
+ * ueberwacht.
  */
 void led_timed(uint8_t color, led_fading_t fading_type)
 {
     LOG_DBG("led_timed");
 
-    // LED aktivieren
-/*    led_faded(color, fading_type);
-    
-    // Timer zum Beenden starten
-    switch(fading_type)
-    {
-        case LED_STATIC:
-        {
-            k_timer_start(&m_led_timer, FIVE_SEC_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT); 
-        }
-        break;
-        
-        case LED_DISCONNECT:
-        case LED_ERROR:
-        {
-            k_timer_start(&m_led_timer, ONE_SEC_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT); 
-        }
-        break;
-                
-        case LED_BONDING:
-        {
-            k_timer_start(&m_led_timer, BOND_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT); 
-        }
-        break;
-        
-        case LED_LOCKING:
-        case LED_UNLOCKING:
-        {
-            k_timer_start(&m_led_timer, MOTOR_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT); 
-        }
-        break;
-        
-        case LED_ALARM:
-        {
-            k_timer_start(&m_led_timer, THIRTY_SEC_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT); 
-        }
-        break;
+    if((size_t)fading_type >= ARRAY_SIZE(m_led_patterns))
+        return;
 
-        case LED_DOUBLE_TAP:
-        {
-            k_timer_start(&m_led_timer, DOUBLE_TAP_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
-        }break;
+    const led_pattern_t* p_pattern = &m_led_patterns[fading_type];
 
-        case LED_SIGNAL:
-        {
-            k_timer_start(&m_led_timer, TEN_SEC_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
-        }break;
+    ili_led_config_t config = {
+        .color       = color,
+        .mode        = p_pattern->mode,
+        .brightness  = p_pattern->brightness,
+        .period_ms   = p_pattern->period_ms,
+        .duration_ms = p_pattern->duration_ms
+    };
 
-        default:
-        {
-
-        }
-        break;
-    }
-        */
+    ili_led_start(&config);
 }
 
 
@@ -1748,7 +1665,7 @@ static void ble_services_init()
         m_auth_state[i] = UNAUTHORISED;
 
     // Device-Name setzen
-    bt_set_name(m_uicr_data.advertising_name);
+    bt_set_name("PRO-TEST");
 }
 
 
@@ -1757,25 +1674,27 @@ static void advertising_init()
     int err;
     struct bt_le_adv_param param = {0};
 
-    param.id           = ILI_NEO_BT_ID;
-    param.sid          = ILI_NEO_BT_ID;
+    param.id           = ILI_PRO_BT_ID;
+    param.sid          = ILI_PRO_BT_ID;
     param.options      = (BT_LE_ADV_OPT_CONN);
     param.interval_min = APP_ADV_INTERVAL_MIN;
     param.interval_max = APP_ADV_INTERVAL_MAX;
-    err = bt_le_ext_adv_create(&param, NULL, &m_ili_neo_adv_set);
+    err = bt_le_ext_adv_create(&param, NULL, &m_ili_pro_adv_set);
     if (err) {
-        LOG_DBG("Could not create ILI NEO advertising set (err %d)", err);
+        LOG_DBG("Could not create ILI PRO advertising set (err %d)", err);
     }
 
     const struct bt_data adv_data[] = {
 	    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR))
     };
 
-    err = bt_le_ext_adv_set_data(m_ili_neo_adv_set, adv_data, ARRAY_SIZE(adv_data),
+    err = bt_le_ext_adv_set_data(m_ili_pro_adv_set, adv_data, ARRAY_SIZE(adv_data),
 	     NULL, 0);
     if (err) {
         LOG_DBG("Could not set data for ILI NEO advertising set (err %d)", err);
     }
+
+    LOG_DBG("advertising_init erfolgreich");
 }
 
 
@@ -1871,7 +1790,7 @@ static void pairing_complete(struct bt_conn *conn, bool bonded)
     static struct bt_conn_info conn_info;
     bt_conn_get_info(conn, &conn_info);
 
-	if(conn_info.id != ILI_NEO_BT_ID)
+	if(conn_info.id != ILI_PRO_BT_ID)
         return;
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
@@ -1890,7 +1809,7 @@ static void pairing_complete(struct bt_conn *conn, bool bonded)
         }
 
         int bond_cnt = 0;
-        bt_foreach_bond(ILI_NEO_BT_ID, setup_accept_list_cb, &bond_cnt);
+        bt_foreach_bond(ILI_PRO_BT_ID, setup_accept_list_cb, &bond_cnt);
         
         // Nach dem Herstellen einer neuen Verbindung kann der Bonding-Modus beendet werden
         m_num_fob_bonds = bond_cnt;
@@ -1964,7 +1883,7 @@ static void scan_init(void)
 	}
 
 	int bond_cnt = 0;
-	bt_foreach_bond(ILI_NEO_BT_ID, setup_accept_list_cb, &bond_cnt);
+	bt_foreach_bond(ILI_PRO_BT_ID, setup_accept_list_cb, &bond_cnt);
 	
     LOG_DBG("Peers added to filterlist = %d", bond_cnt);
 
@@ -2099,7 +2018,7 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 
 	bt_conn_get_info(conn, &conn_info);
 
-	if(conn_info.id != ILI_NEO_BT_ID)
+	if(conn_info.id != ILI_PRO_BT_ID)
         return;
 
 	if (conn_info.role == BT_CONN_ROLE_PERIPHERAL)
@@ -2197,7 +2116,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
 	bt_conn_get_info(conn, &conn_info);
 
-	if(conn_info.id != ILI_NEO_BT_ID)
+	if(conn_info.id != ILI_PRO_BT_ID)
         return;
 
 	if (conn_info.role == BT_CONN_ROLE_PERIPHERAL) 
@@ -2317,7 +2236,7 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
     static struct bt_conn_info conn_info;
     bt_conn_get_info(conn, &conn_info);
 
-	if(conn_info.id != ILI_NEO_BT_ID)
+	if(conn_info.id != ILI_PRO_BT_ID)
         return;
 
 	if (!bt_err) {
@@ -2328,7 +2247,7 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 
         // Bonding löschen, falls es zu dem Handsender bereits ein Bonding gibt
         // und der Handsender aber im Werkszustand ist.
-        bt_unpair(ILI_NEO_BT_ID, conn_info.le.dst);
+        bt_unpair(ILI_PRO_BT_ID, conn_info.le.dst);
         bt_conn_disconnect(m_fob_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
         return;
 	}
@@ -2336,7 +2255,7 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
     // Verbunden zu App -> Bonding löschen
     if(m_bonding_mode_active && conn_info.role == BT_CONN_ROLE_PERIPHERAL)
     {
-        bt_unpair(ILI_NEO_BT_ID, conn_info.le.dst);
+        bt_unpair(ILI_PRO_BT_ID, conn_info.le.dst);
         bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
         return;
     }
@@ -4537,17 +4456,18 @@ static void plug_evt_handler(button_evt_t evt)
         }
         break;
 
-        case MICROSWITCH_EVT_PRESSED:
+        case MAIN_BUTTON_EVT_PRESSED:
         {
-            LOG_DBG("MICROSWITCH_EVT_PRESSED");
+            LOG_DBG("MAIN_BUTTON_EVT_PRESSED");
         }
         break;
 
-        case MICROSWITCH_EVT_RELEASED:
+        case MAIN_BUTTON_EVT_RELEASED:
         {
-            LOG_DBG("MICROSWITCH_EVT_RELEASED");
+            LOG_DBG("MAIN_BUTTON_EVT_RELEASED");
         }
         break;
+        
         default:
         break;
     }
@@ -4571,7 +4491,8 @@ static void gpio_init()
     gpio_init_callback(&accel_int1_cb_data, in_pin_handler, BIT(pin_accel_int1.pin));
     
     // Erkennung der Einsteckkette
-    ili_button_init(plug_evt_handler, false);
+    int ret = ili_button_init(plug_evt_handler);
+    LOG_DBG("ili_button_init = %d", ret);
 }
 
 
@@ -4635,7 +4556,7 @@ static void get_locking_state(void)
     }
 
     // Erkennen, ob Kette eingesteckt ist
-    m_chain_is_present = (ili_button_get_state() == CHAIN_BUTTON_EVT_PRESSED);
+    m_chain_is_present = (ili_button_get_chain_state() == CHAIN_BUTTON_EVT_PRESSED);
     LOG_DBG("Chain is %s", m_chain_is_present ? "present" : "not present");
 
     // Zustand auswerten und anzeigen
@@ -5134,7 +5055,7 @@ void factory_reset()
     // Bondings mit Handsender löschen
     if(m_num_fob_bonds > 0)
     {
-        err = bt_unpair(ILI_NEO_BT_ID, BT_ADDR_LE_ANY);
+        err = bt_unpair(ILI_PRO_BT_ID, BT_ADDR_LE_ANY);
         if(err)
         {
             LOG_ERR("bt_unpair failed with %d", err);
@@ -5459,8 +5380,8 @@ void abort_colorcode_input()
 //             BT_DATA(BT_DATA_NAME_COMPLETE, m_uicr_data.advertising_name, ADV_NAME_LENGTH)
 //         };
 
-// 		if (m_ili_neo_adv_set) {
-// 			err = bt_le_ext_adv_set_data(m_ili_neo_adv_set,
+// 		if (m_ili_neo_adv_pro) {
+// 			err = bt_le_ext_adv_set_data(m_ili_neo_adv_pro,
 // 						     adv_data, ARRAY_SIZE(adv_data),
 // 						     NULL, 0);
 // 			if (err) {
@@ -5557,6 +5478,8 @@ int main(void)
 
     ili_piezo_init();
 
+    ili_led_init();
+
     err = bt_enable(NULL);
 	if (err) {
 		LOG_ERR("Bluetooth init failed (err %d)\n", err);
@@ -5623,7 +5546,7 @@ int main(void)
 		return 0;
 	}
 
-    get_locking_state();
+    //get_locking_state();
 
     if(gpio_pin_get_dt(&pin_charge) == 0)
         m_charge_active = true;
@@ -5675,12 +5598,15 @@ int main(void)
 		LOG_DBG("nicht eingerichtet");
         // Zur Sicherheit wird hier versucht die Settings zu löschen
         zms_delete(&m_filesys, SETTINGS_ID);
+
+        new_bond();
     }
 
     // Batteriestand messen
-    ili_motorcontroller_measure_battery();
+    //ili_motorcontroller_measure_battery();
 
     //ili_piezo_play(ILI_PIEZO_SOUND_ALARM);
+
 
 TD("TODOs:");
 // https://docs.nordicsemi.com/bundle/ncs-1.7.1/page/zephyr/guides/debug_tools/thread-analyzer.html
