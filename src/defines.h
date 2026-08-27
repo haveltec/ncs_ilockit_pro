@@ -101,16 +101,22 @@
 #define BLE_USDIO_ACK                       0x02
 #define BLE_AUTH                            0x04
 
+///////// 4G Diebstahl-Modus //////////
+#define THEFT_MODE_ACTIVE                   0x01
+#define THEFT_MODE_STOLEN                   0x02
+
 // Pin-Auswertung für Eingänge
 #define IRQ_ACC_ALARM                       0x0001
-#define IRQ_MOTOR_CLOSED                    0x0004
-#define IRQ_MOTOR_OPENED                    0x0008
-#define IRQ_DOUBLE_TAP_DETECTED             0x0010
+#define IRQ_ACC_RELOCK                      0x0002
+#define IRQ_MOTOR_1_CLOSED                  0x0004
+#define IRQ_MOTOR_1_OPENED                  0x0008
+#define IRQ_BUTTON                          0x0010
 #define IRQ_PLUG_DETECTION                  0x0020
-#define IRQ_CHARGE_STARTED                  0x0040
-#define IRQ_CHARGE_COMPLETED                0x0080
-#define IRQ_ACC_COLORCODE                   0x0100
-#define IRQ_SINGLE_TAP_DETECTED             0x0200
+#define IRQ_CHARGE_COMPLETED                0x0040
+#define IRQ_MOTOR_2_CLOSED                  0x0080
+#define IRQ_MOTOR_2_OPENED                  0x0100
+#define IRQ_USB_DETECTED                    0x0200
+#define IRQ_USB_REMOVED                     0x0400
 
 #define MAIN_BUTTON_PULL                    NRF_GPIO_PIN_PULLDOWN
 
@@ -151,8 +157,11 @@
 //////////// Verbindungsparameter ////////////
 #define APP_BLE_CONN_CFG_TAG            1                                           /**< A tag identifying the SoftDevice BLE configuration. */
 #define APP_BLE_OBSERVER_PRIO           3                                           /**< Application's BLE observer priority. You shouldn't need to modify this value. */
-#define APP_ADV_INTERVAL_MIN            510                                         /**< The advertising interval (in units of 0.625 ms. This value corresponds to 40 ms). */
-#define APP_ADV_INTERVAL_MAX            700                                         /**< The advertising interval (in units of 0.625 ms. This value corresponds to 40 ms). */
+// TEST (Stromprofil-Diagnose): Intervall auf 1,28 s gesetzt, um zu pruefen,
+// ob die gemessenen Stromspitzen dem Advertiser folgen.
+// ORIGINAL: MIN = 510 (319 ms), MAX = 700 (438 ms)
+#define APP_ADV_INTERVAL_MIN            2048                                        /**< 2048 * 0,625 ms = 1280 ms */
+#define APP_ADV_INTERVAL_MAX            2048                                        /**< 2048 * 0,625 ms = 1280 ms */
 #define APP_ADV_DURATION                BLE_GAP_ADV_TIMEOUT_GENERAL_UNLIMITED       /**< Unlimited advertising in general discoverable mode */
 #define MIN_CONN_INTERVAL               MSEC_TO_UNITS(20, UNIT_1_25_MS)             /**< Minimum acceptable connection interval (20 ms), Connection interval uses 1.25 ms units. */
 #define MAX_CONN_INTERVAL               MSEC_TO_UNITS(75, UNIT_1_25_MS)             /**< Maximum acceptable connection interval (75 ms), Connection interval uses 1.25 ms units. */
@@ -181,7 +190,9 @@
 //////////// UART-Konfiguration ////////////
 #define GSM_TX_BUFF_SIZE 128
 #define GSM_RX_BUFF_SIZE 10
-#define RECEIVE_TIMEOUT 100
+#define RECEIVE_TIMEOUT 100                                                             /**< Inaktivitäts-Timeout des Empfangs in µs, danach meldet der Treiber den Puffer per UART_RX_RDY. */
+#define UART_RX_LINE_SIZE 128                                                           /**< Maximale Länge einer zusammengesetzten Empfangsnachricht (ohne Zeilenende). */
+#define UART_TX_TIMEOUT_US 100000                                                       /**< Timeout für einen Sendevorgang in µs (100 ms). */
 
 //////////// Error-Tag ////////////
 #define DEAD_BEEF                       0xDEADBEEF                                  /**< Value used as error code on stack dump, can be used to identify stack location on stack unwind. */

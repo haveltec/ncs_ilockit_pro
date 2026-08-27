@@ -134,6 +134,7 @@ typedef struct
     uint8_t ble;
 } sound_settings_t;
 
+#define RESERVED_BYTES  31
 typedef struct
 {
     alarm_settings_t alarm;
@@ -141,7 +142,8 @@ typedef struct
     auto_settings_t auto_lock[MAX_PEER_COUNT];
     uint8_t colorcode_flash[3];
     uint8_t sharecode_flash[3];
-    uint8_t reserved[32];
+    uint8_t theft_mode;
+    uint8_t reserved[RESERVED_BYTES];
 } settings_t;
 
 typedef enum
@@ -186,6 +188,7 @@ typedef struct
 	uint8_t     * p_data;    /**< Pointer to data. */
 	uint16_t      data_len;  /**< Length of data. */
 } central_data_t;
+
 
 //////////////////////////////////////////////////////////////
 //                Funktionsdeklatationen                    //
@@ -241,7 +244,13 @@ static void setup_accept_list_cb(const struct bt_bond_info *info, void *user_dat
 //static void fmna_motion_detect_handle(struct k_work *item);
 static void abort_colorcode_input();
 static void start_adv_handler(struct k_work* work);
-static void app_movement_timeout_handler(struct k_work* work);
+static void app_movement_timeout_handler(struct k_work* work);                                         // UART initialisieren
+static void uart_evt_handler(const struct device* dev,
+                             struct uart_event* evt, void* user_data);              // Callback für die Ereignisse des UART-Treibers
+static void gsm_send(uint8_t command);                              // Funktion zum Senden einer GSM-Nachricht
+static void uart_gsm_send_ack(uint8_t command);                     // Funktion zum Senden eines Acknowledges
+static void gps_on();
+static void gps_off();
 //static void start_fmna_pairing_handler(struct k_work* work);
 
 //////////////////////////////////////////////////////////////
@@ -262,6 +271,8 @@ static void six_min_timeout_handler(struct k_timer* timer);
 static void plug_reactivation_timeout_handler(struct k_timer* timer);
 static void bond_allowed_timeout_handler(struct k_timer* timer);
 static void auth_timeout_handler(struct k_timer* timer);
+static void gsm_send_timeout_handler(struct k_timer* timer);
+
 //static void abort_fmna_user_pairing_timeout_handler(struct k_timer* timer);
 
 //////////////////////////////////////////////////////////////
@@ -270,7 +281,24 @@ static void auth_timeout_handler(struct k_timer* timer);
 #define BLE_ADV_CONN_SLOW BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, APP_ADV_INTERVAL_MIN, APP_ADV_INTERVAL_MAX,  \
 			NULL)
 
+// ---------------------------------------------------------------------------
+// Test-Schalter fuer die Advertising-Fehlersuche
+//   ADV_TEST_LEGACY = 1 -> einfaches (Legacy) Advertising via bt_le_adv_start()
+//   ADV_TEST_LEGACY = 0 -> Extended Advertising via bt_le_ext_adv_*()
+// ADV_TEST_NAME ist der fest vorgegebene Advertising-Name (statt UICR-Name).
+// ---------------------------------------------------------------------------
+#define ADV_TEST_LEGACY     1
+#define ADV_TEST_NAME       "ILI-PRO-TEST"
+
+#if ADV_TEST_LEGACY
+// Advertising-Daten: Flags + vollstaendiger Geraetename
+static const struct bt_data m_adv_data[] = {
+    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+    BT_DATA(BT_DATA_NAME_COMPLETE, ADV_TEST_NAME, sizeof(ADV_TEST_NAME) - 1)
+};
+#else
 static struct bt_le_ext_adv *m_ili_pro_adv_set;
+#endif
 
 static struct ili_service_cb ili_callbacks = {
 	.gdio_data_rx_cb    = app_gdio_data_rx_cb,
@@ -300,6 +328,7 @@ K_THREAD_STACK_DEFINE(m_rssi_stack, RSSI_STACKSIZE);                            
 K_MUTEX_DEFINE(m_rssi_mutex);                                                               // Mutex für Thread-Synchronisation
 static uint8_t          m_disconnect_device = 0;                                            // Speichert die Indizes der Geräte, deren Verbindung getrennt werden soll
 static bool             m_stop_rssi = false;
+static uint8_t          m_relock_state = RELOCK_INACTIVE;                                   // Flag für das Schließen nach automatischer Öffnung
 
 //////////////////////////////////////////////////////////////
 //                   App-Kommunikation                      //
@@ -425,6 +454,9 @@ bool        m_signalsound_active = false;       // Gibt an, ob ein Signalton akt
 
 static const struct gpio_dt_spec pin_charge = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, charge_gpios);
 static const struct gpio_dt_spec pin_accel_int1 = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, accel_int1_gpios);
+static const struct gpio_dt_spec pin_gps_enable = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, gps_enable_gpios);
+static const struct gpio_dt_spec pin_gps_button = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, fe_enable_gpios);
+
 
 static struct gpio_callback accel_int1_cb_data;
 static struct gpio_callback charge_cb_data;
@@ -465,10 +497,7 @@ static uint8_t      m_selected_color = SELECTED_COLOR_INIT_VAL; // Gibt an, welc
 static uint8_t      m_colorcode_input_active = false;           // Flag, das angibt ob die Farbcode-Eingabe aktiv ist
 static uint8_t      m_wrong_colorcode_attempts = 0;             // Anzahl der falsch eingegebenen Farbcodes
 static bool         m_colorcode_input_allowed = true;           // Flag, das angbit, ob die Eingabe des Farbcodes erlaubt ist
-static uint32_t     m_last_tap_time = 0;                        // Zeitpunkt der letzten Tap-Erkennung
-static bool         m_first_tap_waiting = false;                // Flag, das angibt, dass ein Tap erkannt wurde
-static bool         m_double_tap_waiting = false;               // Flag, das angibt, dass ein Doppeltap-Kandidat gefunden wurde
-static uint8_t      m_tap_error_counter = 0;                    // Anzahl der Bewegungsinterrupts während auf Single-Tap gewartet wird
+
 
 #define DEBOUNCE_WINDOW_MS              80
 #define SINGLE_TAP_WINDOW_MS            180
@@ -481,6 +510,7 @@ static uint8_t      m_tap_error_counter = 0;                    // Anzahl der Be
 //                       Testmodus                          //
 //////////////////////////////////////////////////////////////
 static uint16_t                 m_needed_tests = TEST_NOT_FOUND;                            // Die notwenigen Tests, die ausgeführt werden sollen
+static bool                     m_gsm_test_successfull = false;                             // Flag, das angibt ob der GSM Test erfolgreich war
 static bool                     m_test_active = false;                                      // Flag, das angibt, ob momentan ein Test aktiv ist
 static uint16_t                 m_actual_test = 0;                                          // Zähler für den aktuell auszuführenden Test
 static bool                     m_update_testmode = false;                                  // Flag für das Speichern des Testmode-Zustands
@@ -491,6 +521,39 @@ static __ALIGN(4) uint16_t      m_testmode_state;
 //////////////////////////////////////////////////////////////
 const struct device *const  m_watchdog = DEVICE_DT_GET(DT_ALIAS(watchdog0));
 int                         m_wdt_channel_id = 0;
+
+//////////////////////////////////////////////////////////////
+//                         UART                             //
+//////////////////////////////////////////////////////////////
+
+
+static uint8_t          m_uart_tx_buf[GSM_TX_BUFF_SIZE];            // Sendepuffer, muss bis UART_TX_DONE gültig bleiben
+static K_SEM_DEFINE(m_uart_tx_sem, 1, 1);                           // Gibt an, ob der Sendepuffer frei ist
+
+static uint8_t          m_uart_rx_buf[2][GSM_RX_BUFF_SIZE];         // Doppelpuffer für den Empfang per DMA
+static uint8_t          m_uart_rx_buf_index = 0;                    // Index des Puffers, der dem Treiber zuletzt übergeben wurde
+static uint8_t          m_uart_rx_line[UART_RX_LINE_SIZE];          // Puffer zum Zusammensetzen einer Nachricht (wird im Interrupt gefüllt)
+static uint16_t         m_uart_rx_line_len = 0;                     // Anzahl der Zeichen in m_uart_rx_line
+static bool             m_uart_rx_overflow = false;                 // Gibt an, ob die aktuelle Nachricht zu lang ist und verworfen wird
+static uint8_t          m_uart_rx_message[UART_RX_LINE_SIZE];       // Vollständig empfangene Nachricht für die Auswertung in der Main-Schleife
+static uint16_t         m_uart_rx_message_len = 0;                  // Länge der Nachricht in m_uart_rx_message
+static volatile bool    m_uart_data_received = false;               // Flag, das angibt, ob eine neue Nachricht empfangen wurde
+
+//////////////////////////////////////////////////////////////
+//                     GSM / GPS                            //
+//////////////////////////////////////////////////////////////
+// UARTE00 ist mit dem GPS-Modul verbunden (TX = P2.08, RX = P2.00, 9600 Baud)
+const struct    device *const  m_uart = DEVICE_DT_GET(DT_NODELABEL(uart00));
+K_MSGQ_DEFINE(m_gsm_cmd_queue, sizeof(uint8_t), 5, 4);
+static bool     m_gps_active = false;           // Gibt an, ob das GPS-Modul aktiv ist
+static bool     m_gsm_msg_available = false;    // Gibt an, ob eine komplette Nachricht empfangen wurde
+static ili_gsm_message_t    m_gsm_message_in;   // Nachricht, die per UART vom GSM-Modul empfangen wurde
+static uint8_t  m_gsm_send_counter = 0;         // Zähler für die Sendeversuche
+static bool     m_gsm_send_cmd = false;         // Flag zum Senden von Befehlen in der Hauptschleife
+static uint8_t  m_gps_lpw_counter = 0;          // Zähler zum Deaktivieren des GPS-Moduls (nur für Low Power Alarm Tracking Modus)
+static uint8_t  m_gps_lpw_timeout = 0;          // Schwelle für den Wechsel in den LowPower Modus (m_gps_lpw_timeout * 6 Min.)
+static bool     m_gps_test_active = false;      // Flag, das angibt, ob das GPS-Modul vom Nutzer aktiviert wurde
+static uint32_t m_gsm_ack_ref_id = 0;           // Referenz-ID für einen empfangenen Befehl
 
 //////////////////////////////////////////////////////////////
 //                     Apple Find-My                        //
@@ -561,6 +624,7 @@ struct k_timer m_six_min_timer;
 struct k_timer m_plug_reactivation_timer;
 struct k_timer m_bond_allowed_timer;
 struct k_timer m_auth_timer;
+struct k_timer m_gsm_send_timer;
 //struct k_timer m_abort_fmna_user_pairing_timer;
 
 
@@ -581,6 +645,8 @@ static void timers_init()
     k_timer_init(&m_plug_reactivation_timer, plug_reactivation_timeout_handler, NULL);
     k_timer_init(&m_bond_allowed_timer, bond_allowed_timeout_handler, NULL);
     k_timer_init(&m_auth_timer, auth_timeout_handler, NULL);
+    k_timer_init(&m_gsm_send_timer, gsm_send_timeout_handler, NULL);
+    
 //    k_timer_init(&m_abort_fmna_user_pairing_timer, abort_fmna_user_pairing_timeout_handler, NULL);
 }
 
@@ -654,9 +720,14 @@ void start_adv_handler(struct k_work* work)
         LOG_DBG("advertising_start");
         
         int err;
+#if ADV_TEST_LEGACY
+        err = bt_le_adv_start(BLE_ADV_CONN_SLOW, m_adv_data, ARRAY_SIZE(m_adv_data), NULL, 0);
+        LOG_DBG("bt_le_adv_start = %d", err);
+#else
         struct bt_le_ext_adv_start_param ext_adv_start_param = {0};
-        
+
         err = bt_le_ext_adv_start(m_ili_pro_adv_set, &ext_adv_start_param);
+#endif
         if (err) {
             LOG_DBG("Advertising for ILI PRO set failed to start (err %d)", err);
             // Nach 5 Sekunden erneut versuchen das Advertisment zu starten
@@ -746,7 +817,7 @@ void app_movement_timeout_handler(struct k_work* work)
 //     actual_sample = get_sample();
 
 //     // Nach dem Auslesen des Samples wieder in den korrekten Modus wechseln
-//     if(m_current_locking_state == STATUS_ALARM_UNARMED)
+//     if(m_current_locking_state == STATUS_MOTOR_1_OPENED)
 //         accelerometer_sleep();
 //     else
 //         accelerometer_sniff();
@@ -1108,6 +1179,61 @@ static void auth_timeout_handler(struct k_timer* timer)
         k_timer_stop(&m_auth_timer);
     }
 }
+
+
+void gsm_send_timeout_handler(struct k_timer* timer)
+{
+    LOG_DBG("gsm_send_timeout_handler - m_gsm_send_counter = %d", m_gsm_send_counter);
+	
+    // Anzahl der Elemente in der FIFO abfragen
+    uint32_t count;
+    count = k_msgq_num_used_get(&m_gsm_cmd_queue);
+    
+    // FIFO ist leer
+    if (count == 0)
+    {
+        LOG_DBG("FIFO leer - Timer stoppen");
+        // Wenn die FIFO leer ist, gibt es hier nichts mehr zu tun. 
+        k_timer_stop(&m_gsm_send_timer);
+        m_gsm_send_counter = 0;
+    }
+    else
+    {
+        // Befehl wurde bereits verschickt. ACK noch nicht erhalten -> Erneut versuchen
+        if(m_gsm_send_counter < GPS_RETRY_COUNT)
+        {
+            // Befehl in Queue lassen
+            m_gsm_send_cmd = true;
+        }
+        else
+        {
+            // Befehl aus Queue entfernen
+            uint8_t command;
+            k_msgq_get(&m_gsm_cmd_queue, &command, K_NO_WAIT); 
+            
+            m_gsm_send_counter = 0;
+            
+            // Es existiert mind. ein weiteres Element und der aktuelle Befehl
+            if(count >= 2)
+            {
+                // Befehl versenden
+                m_gsm_send_cmd = true;
+            }
+            else
+            {
+                // Keine Elemente mehr in der Queue -> Timer kann beendet werden
+                k_timer_stop(&m_gsm_send_timer);
+                
+               if(m_gps_lpw_timeout == 0)
+               {
+                   // GPS deaktivieren
+                   gps_off();
+               }
+            }
+        }
+    }
+}
+
 
 /*
     Timer zum Abbruch der Find-My Pairing Prozedur
@@ -1665,12 +1791,24 @@ static void ble_services_init()
         m_auth_state[i] = UNAUTHORISED;
 
     // Device-Name setzen
-    bt_set_name("PRO-TEST");
+#if ADV_TEST_LEGACY
+    // Fester Testname, unabhaengig vom UICR-Inhalt
+    int name_err = bt_set_name(ADV_TEST_NAME);
+    LOG_DBG("bt_set_name(\"%s\") = %d", ADV_TEST_NAME, name_err);
+#else
+    bt_set_name(m_uicr_data.advertising_name);
+#endif
 }
 
 
 static void advertising_init()
 {
+#if ADV_TEST_LEGACY
+    // Beim Legacy-Advertising werden Parameter und Daten erst in
+    // bt_le_adv_start() uebergeben -> hier ist nichts zu initialisieren.
+    LOG_DBG("advertising_init: Legacy-Advertising, Name = \"%s\" (%d Byte Payload)",
+            ADV_TEST_NAME, 3 + 2 + (int)(sizeof(ADV_TEST_NAME) - 1));
+#else
     int err;
     struct bt_le_adv_param param = {0};
 
@@ -1695,6 +1833,7 @@ static void advertising_init()
     }
 
     LOG_DBG("advertising_init erfolgreich");
+#endif
 }
 
 
@@ -1710,8 +1849,13 @@ static void advertising_stop()
     {
         LOG_DBG("advertising_stop");
         
+#if ADV_TEST_LEGACY
         int err = bt_le_adv_stop();
         LOG_DBG("bt_le_adv_stop = %d", err);
+#else
+        int err = bt_le_ext_adv_stop(m_ili_pro_adv_set);
+        LOG_DBG("bt_le_ext_adv_stop = %d", err);
+#endif
         
         if(err == 0)
             m_advertising_is_active = false;
@@ -1958,7 +2102,7 @@ static void ble_mode_data_received(struct bt_ili_client *ili, const uint8_t *con
             LOG_DBG("ILI_C_LOCK_ACTION");
             if(ili_motorcontroller_get_state() == MOTOR_STOP)
             {
-                set_motion_detection(m_current_locking_state == STATUS_ALARM_UNARMED);
+                set_motion_detection(m_current_locking_state == STATUS_MOTOR_1_OPENED);
             }
         }
         break;
@@ -2275,7 +2419,7 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
         }
                     
         // Bei Verbindungsaufbau Schließbefehl ausführen
-        set_motion_detection(m_current_locking_state == STATUS_ALARM_UNARMED);
+        set_motion_detection(m_current_locking_state == STATUS_MOTOR_1_OPENED);
     }
 
 	gatt_discover(conn);
@@ -2460,7 +2604,7 @@ static void rssi_check(uint16_t conn_handle, uint8_t rssi_new)
     // Übergang von Fern zu Nah, noch nicht begonnen Farbcode einzugeben und Motor nicht aktiv
     if(m_settings.auto_lock[m_connected_peer[conn_handle].peer_data->auth_id].open_active
         && m_dnd_mode_active == false && m_rssi_user_state[conn_handle] == RSSI_STATE_FAR 
-        && rssi_state == RSSI_STATE_NEAR && m_current_locking_state == STATUS_ALARM_ARMED 
+        && rssi_state == RSSI_STATE_NEAR && m_current_locking_state == STATUS_MOTOR_1_CLOSED 
         && m_colorcode_in_index == 0 && ili_motorcontroller_get_state() == MOTOR_STOP)
     {
         set_motion_detection(false);
@@ -2468,7 +2612,7 @@ static void rssi_check(uint16_t conn_handle, uint8_t rssi_new)
     // Nutzer entfernt sich vom NEO -> Abschließen mit Bewegungsprüfung
     else if(m_settings.auto_lock[m_connected_peer[conn_handle].peer_data->auth_id].close_active
         && m_dnd_mode_active == false && m_rssi_user_state[conn_handle] == RSSI_STATE_NEAR 
-        && rssi_state == RSSI_STATE_FAR && m_current_locking_state == STATUS_ALARM_UNARMED 
+        && rssi_state == RSSI_STATE_FAR && m_current_locking_state == STATUS_MOTOR_1_OPENED 
         && ili_motorcontroller_get_state() == MOTOR_STOP)
     {
         // Bewegung prüfen
@@ -3419,7 +3563,7 @@ void usdio_data_received(uint16_t conn_handle)
                         bt_conn_disconnect(m_fob_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
                     }
                 
-                    if(m_current_locking_state_chain == STATUS_MOTOR_OPENED && m_current_locking_state == STATUS_ALARM_UNARMED)
+                    if(m_current_locking_state_chain == STATUS_MOTOR_2_OPENED && m_current_locking_state == STATUS_MOTOR_1_OPENED)
                     {
                         // Alle Bonding-Datensätze löschen
                         m_start_factory_reset = true;
@@ -3776,7 +3920,7 @@ void usdio_data_received(uint16_t conn_handle)
         {
             LOG_DBG("DELETE_PEER");
             // Peer-Daten löschen
-            if(m_usdio_message_in[conn_handle].payload[0] < MAX_PEER_COUNT && m_current_locking_state_chain == STATUS_MOTOR_OPENED && m_current_locking_state == STATUS_ALARM_UNARMED)
+            if(m_usdio_message_in[conn_handle].payload[0] < MAX_PEER_COUNT && m_current_locking_state_chain == STATUS_MOTOR_2_OPENED && m_current_locking_state == STATUS_MOTOR_1_OPENED)
             {
                 if(m_num_app_bonds == 1 && m_num_fob_bonds == 0)
                     m_start_factory_reset = true;
@@ -4062,7 +4206,7 @@ static void set_motion_detection(bool enable)
     
     LOG_DBG("set_motion_detection");
 
-    if(enable && m_current_locking_state == STATUS_ALARM_UNARMED && ili_motorcontroller_get_state() == MOTOR_STOP)
+    if(enable && m_current_locking_state == STATUS_MOTOR_1_OPENED && ili_motorcontroller_get_state() == MOTOR_STOP)
     {
         uint8_t ret = ACC_NO_MOVEMENT;
      
@@ -4077,11 +4221,11 @@ static void set_motion_detection(bool enable)
             LOG_DBG("ACC_NO_MOVEMENT");
             m_acc_check_passed = true;
 
-            m_current_locking_state = STATUS_ALARM_ARMED;
+            m_current_locking_state = STATUS_MOTOR_1_CLOSED;
 
-            if(m_chain_is_present && m_current_locking_state_chain != STATUS_MOTOR_CLOSED)
+            if(m_chain_is_present && m_current_locking_state_chain != STATUS_MOTOR_2_CLOSED)
             {
-                m_current_locking_state_chain = STATUS_MOTOR_CLOSING;
+                m_current_locking_state_chain = STATUS_MOTOR_2_CLOSING;
                 led_timed(LED_R, LED_LOCKING);
         
                 // Motor starten
@@ -4112,7 +4256,7 @@ static void set_motion_detection(bool enable)
         else if((ret & ACC_MOVEMENT) != 0)
         {
             LOG_DBG("Bewegung erkannt beim Scharfschalten");
-            send_status(BLE_CONN_HANDLE_ALL, STATUS_ALARM_ARM_MOVED);
+            send_status(BLE_CONN_HANDLE_ALL, STATUS_MOTOR_1_CLOSE_MOVED);
             
             m_fob_status = ILI_C_CLOSE_MOVED;
             k_work_submit(&work_fob_send_status);
@@ -4127,11 +4271,11 @@ static void set_motion_detection(bool enable)
             m_acc_check_passed = false;
             
             // TODO: Anpassen, wenn das von den Apps unterstützt wird
-            send_status(BLE_CONN_HANDLE_ALL, STATUS_ALARM_ARM_MOVED);
+            send_status(BLE_CONN_HANDLE_ALL, STATUS_MOTOR_1_CLOSE_MOVED);
             //send_status(BLE_CONN_HANDLE_ALL, STATUS_ERR_ACC_SELFTEST_FAILED);
         }
     }
-    else if(enable == false && m_current_locking_state == STATUS_ALARM_ARMED && ili_motorcontroller_get_state() == MOTOR_STOP && m_alarmsound_active == false)
+    else if(enable == false && m_current_locking_state == STATUS_MOTOR_1_CLOSED && ili_motorcontroller_get_state() == MOTOR_STOP && m_alarmsound_active == false)
     {
         LOG_DBG("Alarm entschärfen");
 
@@ -4148,11 +4292,11 @@ static void set_motion_detection(bool enable)
             m_play_batt_warning = true;
         }
 
-        m_current_locking_state = STATUS_ALARM_UNARMED;
+        m_current_locking_state = STATUS_MOTOR_1_OPENED;
 
-        if(m_current_locking_state_chain != STATUS_MOTOR_OPENED && m_chain_is_present)
+        if(m_current_locking_state_chain != STATUS_MOTOR_2_OPENED && m_chain_is_present)
         {
-            m_current_locking_state_chain = STATUS_MOTOR_OPENING;
+            m_current_locking_state_chain = STATUS_MOTOR_2_OPENING;
             led_timed(LED_G, LED_UNLOCKING);
 
             // Motor starten
@@ -4208,7 +4352,7 @@ void alarmcheck_start()
     if(m_settings.alarm.armed && m_factory_condition == false
         && ili_motorcontroller_get_state() == MOTOR_STOP
         && m_alarmsound_active == false && m_prealarm_active == false 
-        && m_current_locking_state == STATUS_ALARM_ARMED)
+        && m_current_locking_state == STATUS_MOTOR_1_CLOSED)
     {
         LOG_DBG("alarmcheck_start()");
 
@@ -4288,59 +4432,17 @@ static void in_pin_handler(const struct device *dev, struct gpio_callback *cb, u
     {
         if(gpio_pin_get_dt(&pin_charge))
             m_triggered_pins |= IRQ_CHARGE_COMPLETED;
-        else
-        {
-            m_triggered_pins |= IRQ_CHARGE_STARTED;
-        }
     }
     else if(bit_to_pin == pin_accel_int1.pin)
     {
-        now = k_uptime_get();
-
-        if(now - m_last_tap_time < DEBOUNCE_WINDOW_MS)
+        if(m_relock_state == RELOCK_MOVEMENT_CHECK)
         {
-            // Debounce Tap -> Gilt trotzdem als Alarm-Event
-            LOG_DBG("Debounce");
-            if(!m_colorcode_input_active && m_dnd_mode_active == false/* && m_fmna_user_pairing_active == false*/)
-            {
-                m_triggered_pins |= IRQ_ACC_ALARM;
-                m_collected_debounce_samples++;
-            }
-
-            return;
+            m_triggered_pins |= IRQ_ACC_RELOCK;
         }
-
-        if(m_colorcode_input_active)
-            m_triggered_pins |= IRQ_ACC_COLORCODE;
-        else
+        else if(m_current_locking_state != STATUS_MOTOR_1_OPENED)
         {
-            // Erster Tap -> Zeit nehmen
-            if(!m_first_tap_waiting)
-            {
-                if(m_double_tap_waiting == false)
-                {
-                    LOG_DBG("First Tap registration - diff %lld", k_uptime_get() - m_last_tap_time);
-                    m_last_tap_time = k_uptime_get();
-                    m_first_tap_waiting = true;
-                    m_tap_error_counter = 0;
-                }
-                else
-                {
-                    if(m_tap_error_counter > NUM_DOUBLE_TAP_WAITING_ERRORS)
-                    {
-                        LOG_DBG("First Tap registration - diff %lld", k_uptime_get() - m_last_tap_time);
-                        m_last_tap_time = k_uptime_get();
-                        m_first_tap_waiting = true;
-                        m_double_tap_waiting = false;
-                    }
-                    m_tap_error_counter++;
-                }
-                
-            }
-
-            //if(m_fmna_user_pairing_active == false)
-                m_triggered_pins |= IRQ_ACC_ALARM;
-        }   
+            m_triggered_pins |= IRQ_ACC_ALARM;
+        }
     }
 }
 
@@ -4356,9 +4458,9 @@ static void motorcontroller_evt_handler(mc_evt_t evt)
             LOG_DBG("MC_ENDPOS_REACHED");
 
             if(evt.last_state == MOTOR_OPEN)
-                m_triggered_pins |= IRQ_MOTOR_OPENED;
+                m_triggered_pins |= IRQ_MOTOR_2_OPENED;
             else if(evt.last_state == MOTOR_CLOSE)
-                m_triggered_pins |= IRQ_MOTOR_CLOSED;
+                m_triggered_pins |= IRQ_MOTOR_2_CLOSED;
         }
         break;
 
@@ -4367,7 +4469,7 @@ static void motorcontroller_evt_handler(mc_evt_t evt)
         {
             LOG_DBG("MC_ENDPOS_TIMEOUT or MC_MOTOR_BLOCKED");
     
-            m_current_locking_state_chain = STATUS_MOTOR_LOCK_STATE_UNKNOWN;
+            m_current_locking_state_chain = STATUS_MOTOR_2_LOCK_STATE_UNKNOWN;
             k_work_submit(&work_retention_write);
 
             // Rote LED blinken lassen
@@ -4377,12 +4479,12 @@ static void motorcontroller_evt_handler(mc_evt_t evt)
 
             if(evt.last_state == MOTOR_OPEN)
             {
-                send_status(BLE_CONN_HANDLE_ALL, STATUS_MOTOR_OPEN_BLOCKED);
+                send_status(BLE_CONN_HANDLE_ALL, STATUS_MOTOR_2_OPEN_BLOCKED);
                 m_fob_status = ILI_C_OPEN_BLOCKED;
             }
             else if(evt.last_state == MOTOR_CLOSE)
             {
-                send_status(BLE_CONN_HANDLE_ALL, STATUS_MOTOR_CLOSE_BLOCKED);
+                send_status(BLE_CONN_HANDLE_ALL, STATUS_MOTOR_2_CLOSE_BLOCKED);
                 m_fob_status = ILI_C_CLOSE_BLOCKED;
             }
 
@@ -4490,6 +4592,10 @@ static void gpio_init()
 	gpio_pin_interrupt_configure_dt(&pin_accel_int1, GPIO_INT_EDGE_RISING);
     gpio_init_callback(&accel_int1_cb_data, in_pin_handler, BIT(pin_accel_int1.pin));
     
+    // GPS
+    gpio_pin_configure_dt(&pin_gps_enable, GPIO_OUTPUT_INACTIVE);
+    gpio_pin_configure_dt(&pin_gps_button, GPIO_OUTPUT_INACTIVE);
+
     // Erkennung der Einsteckkette
     int ret = ili_button_init(plug_evt_handler);
     LOG_DBG("ili_button_init = %d", ret);
@@ -4515,21 +4621,21 @@ static void get_locking_state(void)
 
     // Wenn in der Variable für den Schließzustand nichts plausibles steht
     // wird die Endlage neu abgefragt
-    if(m_current_locking_state_chain != STATUS_MOTOR_OPENED
-        && m_current_locking_state_chain != STATUS_MOTOR_CLOSED
-        && m_current_locking_state_chain != STATUS_MOTOR_LOCK_STATE_UNKNOWN)
+    if(m_current_locking_state_chain != STATUS_MOTOR_2_OPENED
+        && m_current_locking_state_chain != STATUS_MOTOR_2_CLOSED
+        && m_current_locking_state_chain != STATUS_MOTOR_2_LOCK_STATE_UNKNOWN)
     {
         // Schließzustand setzen
         if(m_factory_condition)
-            m_current_locking_state_chain = STATUS_MOTOR_OPENED;
+            m_current_locking_state_chain = STATUS_MOTOR_2_OPENED;
         else
-            m_current_locking_state_chain = STATUS_MOTOR_LOCK_STATE_UNKNOWN;
+            m_current_locking_state_chain = STATUS_MOTOR_2_LOCK_STATE_UNKNOWN;
     }
     
     // Alarm-Zustand auslesen/festlegen
     if(m_factory_condition)
     {
-        m_current_locking_state = STATUS_ALARM_UNARMED;
+        m_current_locking_state = STATUS_MOTOR_1_OPENED;
     }
     else if(retention_is_valid(m_ram))
     {
@@ -4540,18 +4646,18 @@ static void get_locking_state(void)
     LOG_DBG("m_current_locking_state im RAM = %d", m_current_locking_state);
 
     // Kein korrekter Zustand gefunden
-    if(m_current_locking_state != STATUS_ALARM_ARMED && m_current_locking_state != STATUS_ALARM_UNARMED)
+    if(m_current_locking_state != STATUS_MOTOR_1_CLOSED && m_current_locking_state != STATUS_MOTOR_1_OPENED)
     {
-        if(m_current_locking_state_chain == STATUS_MOTOR_CLOSED)
+        if(m_current_locking_state_chain == STATUS_MOTOR_2_CLOSED)
         {
-            m_current_locking_state = STATUS_ALARM_ARMED;
-            LOG_DBG("m_current_locking_state = STATUS_ALARM_ARMED");
+            m_current_locking_state = STATUS_MOTOR_1_CLOSED;
+            LOG_DBG("m_current_locking_state = STATUS_MOTOR_1_CLOSED");
         }
         else
         {
-            m_current_locking_state = STATUS_ALARM_UNARMED;
+            m_current_locking_state = STATUS_MOTOR_1_OPENED;
             
-            LOG_DBG("m_current_locking_state = STATUS_ALARM_UNARMED");
+            LOG_DBG("m_current_locking_state = STATUS_MOTOR_1_OPENED");
         }
     }
 
@@ -4563,19 +4669,19 @@ static void get_locking_state(void)
     if(m_chain_is_present)
     {
         // Endlage auswerten
-        if(m_current_locking_state_chain == STATUS_MOTOR_CLOSED)
+        if(m_current_locking_state_chain == STATUS_MOTOR_2_CLOSED)
         {
             LOG_DBG("get_locking_state() - geschlossen - Alarm aktiv");
             // Rote LED anschalten
             led_timed(LED_R, LED_STATIC);
 
-            m_current_locking_state = STATUS_ALARM_ARMED;
+            m_current_locking_state = STATUS_MOTOR_1_CLOSED;
         }
         // Endlage Geöffnet erreicht
-        else if(m_current_locking_state_chain == STATUS_MOTOR_OPENED)
+        else if(m_current_locking_state_chain == STATUS_MOTOR_2_OPENED)
         {
             LOG_DBG("get_locking_state() - geöffnet");
-            if(m_current_locking_state == STATUS_ALARM_ARMED)
+            if(m_current_locking_state == STATUS_MOTOR_1_CLOSED)
             {
                 LOG_DBG("get_locking_state() - Alarm aktiv");
                 // Rote LED anschalten
@@ -4594,7 +4700,7 @@ static void get_locking_state(void)
         else
         {
             LOG_DBG("get_locking_state() - undefiniert");
-            m_current_locking_state = STATUS_ALARM_ARMED;
+            m_current_locking_state = STATUS_MOTOR_1_CLOSED;
             
             // rote LED blinken lassen  
             led_timed(LED_R, LED_ERROR);
@@ -4602,7 +4708,7 @@ static void get_locking_state(void)
     }
     else
     {
-        if(m_current_locking_state == STATUS_ALARM_ARMED)
+        if(m_current_locking_state == STATUS_MOTOR_1_CLOSED)
         {
             // Rote LED anschalten
             led_timed(LED_R, LED_STATIC);
@@ -4771,10 +4877,545 @@ static void wdt_init()
 	}
 }
 
+//////////////////////////////////////////////////////////////
+//                         UART                             //
+//////////////////////////////////////////////////////////////
+/**@brief Funktion zum Aktivieren des GPS-Moduls.
+ */
+static void gps_on()
+{
+    if(m_uicr_data.variant >= VARIANT_GPS_2G && m_gps_active == false)
+    {
+        LOG_DBG("GPS an");
+        
+        gpio_pin_set_dt(&pin_gps_enable, 1);
+        
+
+        m_gps_active = true;
+        
+        // UART-Verbindung wird nur bei der 4G-Variante initialisiert
+        if(m_uicr_data.variant == VARIANT_GPS_4G || (m_needed_tests & TEST_GSM) != 0)
+        {
+            /**
+             * @brief Initialisierung des UART und Starten des Empfangs
+             */
+
+            if(!device_is_ready(m_uart))
+            {
+                LOG_ERR("%s: device not ready.", m_uart->name);
+                return;
+            }
+
+            int err = uart_callback_set(m_uart, uart_evt_handler, NULL);
+            if(err)
+            {
+                LOG_ERR("uart_callback_set = %d", err);
+                return;
+            }
+
+            err = uart_rx_enable(m_uart, m_uart_rx_buf[m_uart_rx_buf_index], GSM_RX_BUFF_SIZE, RECEIVE_TIMEOUT);
+            if(err)
+                LOG_ERR("uart_rx_enable = %d", err);
+        }
+    }
+}
+
+
+/**@brief FFunktion zum Deaktivieren des GPS-Moduls.
+ */
+static void gps_off()
+{
+    if(m_gps_active && m_gps_test_active == false)
+    {
+        LOG_DBG("GPS aus");
+        
+        // UART-Verbindung wird nur bei der 4G-Variante initialisiert
+        if(m_uicr_data.variant == VARIANT_GPS_4G || (m_needed_tests & TEST_GSM) != 0)
+        {
+            // Befehlsqueue leeren und Timer zum Senden stoppen
+            k_timer_stop(&m_gsm_send_timer);
+            k_free(&m_gsm_cmd_queue);
+            m_gsm_send_cmd = false;
+            
+            gpio_pin_set_dt(&pin_gps_button, 0);
+
+            uart_tx_abort(m_uart);    // laufenden Sendevorgang abbrechen
+            uart_rx_disable(m_uart);  // Empfang beenden
+            LOG_DBG("UART uninit");
+            
+            // Initialisierung der UART-Pins um Energie zu sparen
+            //nrf_gpio_cfg_output(PIN_GSM_TX);
+            //nrf_gpio_pin_write(PIN_GSM_TX, 0);
+            //nrf_gpio_input_disconnect(PIN_GSM_RX);
+        }
+
+        gpio_pin_set_dt(&pin_gps_enable, 0);
+        m_gps_active = false;
+        
+        // Counter zum Deaktivieren nach Alarmfall im Low-Power Modus
+        m_gps_lpw_counter = 0;
+        // Timeout nur resetten, wenn es anderweitig wieder gesetzt wird
+        m_gps_lpw_timeout = 0;
+    }
+}
+
+
+static void evaluate_gsm_msg()
+{
+    LOG_DBG("evaluate_gsm_msg");
+    
+    bool send_ack = false;
+    
+    // Referenz-ID extrahieren
+    memcpy(&m_gsm_ack_ref_id, &m_gsm_message_in.payload[m_gsm_message_in.payload_len - 4], 4);
+    
+    // Serverbefehl auslesen
+    switch(m_gsm_message_in.command)
+    {
+        case CMD_STATUS_ONLINE:
+        {
+            LOG_DBG("CMD_ONLINE");
+            
+        }break;
+
+        case CMD_THEFT_RESP:
+        {
+            LOG_DBG("CMD_THEFT_RESP");
+            
+            uint8_t command;
+
+            if(k_msgq_peek(&m_gsm_cmd_queue, &command) == 0)
+            {
+                LOG_DBG("Command in FIFO: 0x%.2X", command);
+                // Prüfen, ob Antwort auf Theft-Request bekommen
+                if(command == CMD_THEFT_REQ)
+                {
+                    // Alten Befehl entfernen
+                    k_msgq_get(&m_gsm_cmd_queue, &command, K_NO_WAIT);
+                    LOG_DBG("Command aus FIFO entfernen");
+                }
+            }
+        
+            LOG_DBG("Payload Length = %d", m_gsm_message_in.payload_len);
+            
+            if(m_gsm_message_in.payload_len > 0)
+            {
+                LOG_DBG("Payload = %d", m_gsm_message_in.payload[0]);
+                LOG_DBG("m_settings.theft_mode = %d", m_settings.theft_mode);
+                
+                // Gestohlen-Bit steht an zweiter Stelle, daher wird der Payload zum Vergleich um eine Stelle verschoben
+                if((m_settings.theft_mode & THEFT_MODE_STOLEN) != (m_gsm_message_in.payload[0] << 1))
+                {
+                    if(m_gsm_message_in.payload[0])
+                        m_settings.theft_mode |= THEFT_MODE_STOLEN;
+                    else
+                        m_settings.theft_mode ^= THEFT_MODE_STOLEN;
+                    
+                    LOG_DBG("Theft mode after setting = %d", m_settings.theft_mode);
+                    m_update_settings = true;
+                }
+                    
+                // Wenn nicht gestohlen und keine Befehle mehr zum Senden vorhanden
+                // kann das GPS deaktiviert werden
+                if((m_settings.theft_mode & THEFT_MODE_STOLEN) == 0 && 	k_msgq_num_used_get(&m_gsm_cmd_queue) == 0 && m_gps_lpw_timeout == 0)
+                {
+                    // Wenn nicht gestohlen, kann das GPS wieder ausgeschaltet werden
+                    gps_off();
+                }
+            }
+        }break;
+        
+        case CMD_SIGNAL_SOUND:
+        {
+            send_ack = true;
+            
+            if(m_prealarm_active)
+            {
+                k_timer_start(&m_reset_prealarm_timer, TEN_SEC_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
+            }
+            
+            //Alarm deaktivieren
+            all_sounds_stop();
+            alarmcheck_stop();
+            
+            // Signaltonwiedergabe starten
+            signalsound_start();
+        }break;
+        
+        case CMD_ACK:
+        {
+            LOG_DBG("ACK received for 0x%.2X", m_gsm_message_in.payload[0]);
+            uint8_t command;
+            
+            // Im Testmodus soll nur das erste ACK beachtet werden
+            // Weitere ACKs werden übersprungen
+            if(m_gsm_test_successfull)
+            {
+                return;
+            }
+            
+            if(k_msgq_peek(&m_gsm_cmd_queue, &command) == 0)
+            {
+                LOG_DBG("Command in FIFO: 0x%.2X", command);
+                // Prüfen, ob ACK für den richtigen Befehl erhalten
+                if(command == m_gsm_message_in.payload[0])
+                {
+                    // Alten Befehl entfernen
+                    k_msgq_get(&m_gsm_cmd_queue, &command, K_NO_WAIT);
+                    
+                    // Aktionen nach Erhalt eines ACKs ausführen
+                    switch(command)
+                    {
+                        case CMD_TESTMODE_SERIAL_PRO:
+                        {
+                            if(!m_gsm_test_successfull)
+                            {
+                                gps_off();
+                                k_msleep(100);
+                                gsm_send(CMD_TESTMODE_SERIAL_PRO);
+                            }
+                            
+                            // Wenn die Seriennummer übertragen wurde, war der Testmodus erfolgreich
+                            m_gsm_test_successfull = true;
+                            return;
+                        }break;
+                        
+                        case CMD_STATUS_NOT_STOLEN:
+                        {
+                            // Nachdem das Schloss den erw. Diebstahlmodus verlassen hat
+                            // kann auch der Timeout eines Alarms beendet und das GPS ausgeschaltet werden
+                            m_gps_lpw_timeout = 0;
+                        }break;
+                    }
+                    
+                    // Anzahl der Elemente in der FIFO abfragen
+                    if(k_msgq_num_used_get(&m_gsm_cmd_queue) > 0)
+                    {
+                        LOG_DBG("Weiteren Befehl in Queue versenden");
+                        // Weitere Elemente in der Queue -> Nächsten Befehl senden
+                        m_gsm_send_counter = 0;
+                        m_gsm_send_cmd = true;
+                    }
+                    else
+                    {
+                        LOG_DBG("Queue leer - Timer stoppen");
+                        // Keine weiteren Elemente vorhanden -> Timer beenden
+                        k_timer_stop(&m_gsm_send_timer);
+                        
+                        LOG_DBG("m_gps_lpw_timeout: %d", m_gps_lpw_timeout);
+                        LOG_DBG("m_gps_lpw_counter: %d", m_gps_lpw_counter);
+                        
+                        // Wenn das Modul bei der gesendeten Notification nicht aktiv bleiben soll
+                        // und es nicht als gestohlen gemeldet ist, wird es abgeschaltet
+                        if(m_gps_lpw_timeout == 0 && (m_settings.theft_mode & THEFT_MODE_STOLEN) == 0)
+                        {
+                            // GPS deaktivieren
+                            gps_off();
+                        }
+                    }
+                }
+            }
+            else
+            {
+                LOG_DBG("Nichts mehr in FIFO");
+                // Keine Elemente vorhanden -> Timer beenden
+                k_timer_stop(&m_gsm_send_timer);
+            }
+        }break;
+        
+        default:
+        {
+            gsm_send(CMD_ERR_WRONG_COMMAND);   
+        }break;
+    }
+    
+     // Acknowledgement senden und/oder Einstellungen speichern
+    if(send_ack)
+    {
+        LOG_DBG("m_gsm_ack_ref_id = %d", m_gsm_ack_ref_id);
+        uart_gsm_send_ack(m_gsm_message_in.command);
+    }
+}
+
+
+void gsm_send(uint8_t command)
+{
+    // GPS anschalten, falls notwendig
+    gps_on();
+    
+    // Daten werden nur bei der 4G-Variante versendet
+    if(m_uicr_data.variant == VARIANT_GPS_4G || (m_needed_tests & TEST_GSM) != 0)
+    {
+        LOG_DBG("gsm_send() - 0x%.2X", command);
+        uint8_t next_cmd;
+        // Alarmmeldungen werden am Anfang der Liste eingefügt
+        // Peek auf erstes Element in Liste -> Wenn Element vorhanden wird das gelesen und 0 zurückgeliefert
+        if(k_msgq_peek(&m_gsm_cmd_queue, &next_cmd) == 0 && command == CMD_STATUS_ALARM)
+        {
+            // Erstes Element der Queue prüfen
+            LOG_DBG("Next CMD = 0x%.2X", next_cmd);
+            
+            if(next_cmd != CMD_STATUS_ALARM)
+            {
+                LOG_DBG("Insert Alarm");
+                // Alarmmeldung am Anfang der Queue einfügen
+                k_msgq_put_front(&m_gsm_cmd_queue, &command);
+                
+                // Sende-Zähler zurücksetzen, 
+                // da neuer Befehl an den Beginn der Liste gesetzt wurde
+                m_gsm_send_counter = 0;
+            }
+            else
+            {
+                LOG_DBG("Skip Alarm");
+            }
+        }
+        else
+        {
+            // Befehl in die Queue packen
+            k_msgq_put(&m_gsm_cmd_queue, &command, K_NO_WAIT);
+        }
+        
+        // FIFO war leer -> Befehl kann sofort gesendet und der Timer gestartet werden
+        if (k_msgq_num_used_get(&m_gsm_cmd_queue) == 1)
+        {
+            LOG_DBG("FIFO leer - Senden");
+            // Timer zur Kontrolle (neu)starten
+            k_timer_start(&m_gsm_send_timer, GSM_SEND_TIMEOUT_INTERVAL, GSM_SEND_TIMEOUT_INTERVAL);
+            
+            // Datenpaket absenden
+            m_gsm_send_counter = 0;
+            m_gsm_send_cmd = true;
+        }
+    }
+}
+
+
+/**@brief   Funktion zum Senden eines Befehls über UART.
+ *
+ */
+void uart_gsm_send(uint8_t command)
+{
+    LOG_DBG("uart_gsm_send");  
+
+    static uint8_t gsm_msg_tx[UART_RX_BUF_SIZE];    
+    
+    if(m_gps_active == false)
+    {
+        LOG_DBG("GPS not active");
+        return;
+    }
+    
+    if(k_sem_take(&m_uart_tx_sem, K_NO_WAIT) != 0)
+    {
+        LOG_WRN("UART sendet noch");
+        return;
+    }
+
+    gpio_pin_set_dt(&pin_gps_button, 1);
+    // Pause für Aktivierung des UARTs    
+    k_msleep(100);
+    gpio_pin_set_dt(&pin_gps_button, 0);
+    
+    memset(gsm_msg_tx, 0, UART_TX_BUF_SIZE);
+    
+    // Header festlegen
+    gsm_msg_tx[0] = 0x0A;
+    gsm_msg_tx[1] = 0x0B;
+    gsm_msg_tx[2] = command;
+    
+    switch(command)
+    {
+        // Schloss-Info
+        case CMD_INFO_B2C:
+        {
+            LOG_DBG("CMD_INFO_B2C");
+                        
+            gsm_msg_tx[3]  = 16;
+            gsm_msg_tx[4]  = FIRMWARE_MAJOR;
+            gsm_msg_tx[5]  = 100;//ili_battery_get_value();
+            gsm_msg_tx[6]  = m_current_locking_state;
+            gsm_msg_tx[7]  = FIRMWARE_MINOR;
+            gsm_msg_tx[8]  = (gpio_pin_get_dt(&pin_charge) == 0);
+            gsm_msg_tx[9]  = m_settings.theft_mode;
+            gsm_msg_tx[10] = m_settings.alarm.armed;
+            gsm_msg_tx[11] = m_settings.alarm.ble;
+            gsm_msg_tx[12] = m_settings.sound.ble;
+            gsm_msg_tx[13] = m_bl_version;
+            gsm_msg_tx[14] = m_current_locking_state_chain;
+            // Platzhalter
+            //gsm_msg_tx[15]
+            //gsm_msg_tx[16]
+            //gsm_msg_tx[17]
+            //gsm_msg_tx[18]
+            //gsm_msg_tx[19]
+            
+            break;
+        }
+        
+        case CMD_TESTMODE_SERIAL_PRO:
+        {
+            LOG_DBG("CMD_TESTMODE_SERIAL_PRO");
+            gsm_msg_tx[3] = ADV_NAME_LENGTH;
+            memcpy(&gsm_msg_tx[4], m_uicr_data.advertising_name, ADV_NAME_LENGTH);
+            
+        }break;
+        
+        case CMD_STATUS_ALARM:
+        {
+            // Statusmeldung für Alarm (15 Min. online)
+            LOG_DBG("Alarm-Meldung");
+            gsm_msg_tx[3] = 0;
+            m_gps_lpw_timeout = 3;
+        }break;
+        
+        case CMD_THEFT_REQ:
+        {
+            // Abfrage des Diebstahlstatus alle 24h
+            LOG_DBG("Diebstahl-Anfrage");
+            gsm_msg_tx[3] = 0;
+        }break;
+        
+        default:
+        {
+            // Statusmeldung (Alarm, Unfall, Schließfehler, Tracking-Modus etc.)
+            LOG_DBG("default case for status and error messages");
+            gsm_msg_tx[3] = 0;
+            break;
+        }
+    }
+    
+    // CRC berechnen und an Nachricht anfügen
+    uint16_t crc = crc16_itu_t(CRC_SEED, &gsm_msg_tx[2], gsm_msg_tx[3] + 2);
+    memcpy(&gsm_msg_tx[gsm_msg_tx[3] + 4], &crc, 2);
+    
+    LOG_HEXDUMP_DBG(gsm_msg_tx, gsm_msg_tx[3] + 6, "Message: ");
+    
+    // Pause für Aktivierung des UARTs    
+    k_msleep(100);
+    int err = uart_tx(m_uart, gsm_msg_tx, gsm_msg_tx[3] + 6, UART_TX_TIMEOUT_US);
+    if(err)
+    {
+        LOG_ERR("uart_tx = %d", err);
+        k_sem_give(&m_uart_tx_sem);
+    }
+
+    // Counter für Sendeversuche außerhalb des Testmodus erhöhen
+    if(m_needed_tests == TEST_NOT_FOUND)
+        m_gsm_send_counter++;
+}
+
+
+void uart_gsm_send_ack(uint8_t command)
+{
+	LOG_DBG("uart_gsm_send_ack() - 0x%.2X", command);
+	
+    if(k_sem_take(&m_uart_tx_sem, K_NO_WAIT) != 0)
+    {
+        LOG_WRN("UART sendet noch");
+        return;
+    }
+
+    // Header festlegen
+    static uint8_t gsm_msg_tx[11] = {0x0A, 0x0B, 0xAC, 5, 0, 0, 0, 0, 0, 0, 0};
+    
+    if(m_gps_active)
+    {
+        gsm_msg_tx[4] = command;
+        
+        memcpy(&gsm_msg_tx[5], &m_gsm_ack_ref_id, 4);
+        
+        // CRC berechnen und an Nachricht anfügen
+        uint16_t crc = crc16_itu_t(CRC_SEED, &gsm_msg_tx[2], gsm_msg_tx[3] + 2);
+        memcpy(&gsm_msg_tx[9], &crc, 2);
+        
+        // Datenpaket absenden
+        gpio_pin_set_dt(&pin_gps_button, 1);
+        // Pause für Aktivierung des UARTs    
+        k_msleep(100);
+        gpio_pin_set_dt(&pin_gps_button, 0);
+        k_msleep(100);
+        
+        int err = uart_tx(m_uart, gsm_msg_tx, 11, UART_TX_TIMEOUT_US);
+        if(err)
+        {
+            LOG_ERR("uart_tx = %d", err);
+            k_sem_give(&m_uart_tx_sem);
+        }
+    }
+}
+///////////////////////////////////////////////////////////////////////////////
+
+
+/**
+ * @brief Callback für die Ereignisse des UART-Treibers
+ *
+ * Wird im Interrupt-Kontext aufgerufen, daher hier keine langlaufenden
+ * Aktionen ausführen.
+ */
+static void uart_evt_handler(const struct device* dev, struct uart_event* evt, void* user_data)
+{
+    switch(evt->type)
+    {
+        case UART_TX_DONE:
+        case UART_TX_ABORTED:
+            // Sendepuffer wieder freigeben
+            k_sem_give(&m_uart_tx_sem);
+            break;
+
+        case UART_RX_RDY:
+            
+            break;
+
+        case UART_RX_BUF_REQUEST:
+        {
+            // Dem Treiber die jeweils andere Hälfte des Doppelpuffers anbieten
+            m_uart_rx_buf_index ^= 1;
+
+            int err = uart_rx_buf_rsp(dev, m_uart_rx_buf[m_uart_rx_buf_index], GSM_RX_BUFF_SIZE);
+            if(err)
+            {
+                // Puffer wurde nicht übernommen -> Index zurücksetzen
+                m_uart_rx_buf_index ^= 1;
+                LOG_WRN("uart_rx_buf_rsp = %d", err);
+            }
+        }
+        break;
+
+        case UART_RX_BUF_RELEASED:
+            break;
+
+        case UART_RX_DISABLED:
+        {
+            LOG_DBG("UART_RX_DISABLED");
+        }
+        break;
+
+        case UART_RX_STOPPED:
+            LOG_WRN("UART RX gestoppt (reason = %d)", evt->data.rx_stop.reason);
+            break;
+
+        default:
+            break;
+    }
+}
+
+
+/** @brief Aktion, die ausgeführt wird, wenn der Taster losgelassen wird
+*/
+void do_button_action()
+{
+
+}
+
 
 static void evaluate_gpio_pins()
 {
-    if(is_pin_triggered(IRQ_CHARGE_COMPLETED))
+    if(is_pin_triggered(IRQ_USB_DETECTED))
+    {
+        LOG_DBG("IRQ_USB_DETECTED");
+    }
+    else if(is_pin_triggered(IRQ_CHARGE_COMPLETED))
     {
         LOG_DBG("IRQ_CHARGE_COMPLETED");
 
@@ -4796,50 +5437,17 @@ static void evaluate_gpio_pins()
         if(!m_bonding_mode_active)
             led_off();
     }
-    else if(is_pin_triggered(IRQ_CHARGE_STARTED))
+    else if(is_pin_triggered(IRQ_USB_REMOVED))
     {
-        LOG_DBG("IRQ_CHARGE_STARTED");
-
-        // Im Werkszustand oder nach Farbcode-Eingabe den Bonding-Modus starten
-        if(m_factory_condition || m_bonding_allowed)
-        {
-            new_bond();
-        }
-        else if(/*m_fmna_paired == false && */m_current_locking_state == STATUS_ALARM_UNARMED /*&& m_current_locking_state_chain == STATUS_MOTOR_OPENED*/
-                && authorised_user_connected() == false/* && m_fmna_user_pairing_active == false && m_fmna_pairing_mode_active == false*/)
-        {
-
-            LOG_DBG("Start FMNA Pairing by User");
-            // Wenn kein Find-My Pairing vorhanden, der Alarm nicht scharf, die Kette geöffnet und kein Nutzer verbunden ist, wird die Erkennung aktiviert,
-            // ob der Find-My Pairing Modus gestartet werden soll
-            //m_fmna_user_pairing_active = true;
-            
-            // Beschleunigungssensor aktivieren
-            k_work_submit(&work_acc_sniff);
-            
-            // Pin-Interupt aktivieren, um Doppeltap zu erkennen
-            gpio_add_callback(pin_accel_int1.port, &accel_int1_cb_data);
-
-            //Abbruch nach 30 Sek. wenn kein Doppeltap erkannt wird
-            //k_timer_start(&m_abort_fmna_user_pairing_timer, THIRTY_SEC_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
-        }
-        // else if(m_fmna_pairing_mode_active)
-        // {
-        //     // Find-My Pairing starten
-        //     uint32_t err = fmna_pairing_mode_enter();
-        //     if (err) {
-        //         LOG_DBG("Cannot enter the FMN pairing mode (err: %d)", err);
-        //     } else {
-        //         LOG_DBG("%s the FMN pairing mode Extending");
-        //         ili_piezo_play(ILI_PIEZO_SOUND_FMNA_START_PAIRING);
-        //     }
-        // }
-
-        m_charge_active = true;
-        m_restart_allowed = true;
-
-        if(!m_bonding_mode_active)
-            led_faded(LED_R, LED_CHARGING);
+        LOG_DBG("IRQ_USB_REMOVED");
+    }
+    else if(is_pin_triggered(IRQ_BUTTON))
+    {
+        LOG_DBG("PIN_BUTTON with %d ticks", m_button_counter);
+        
+        if(m_bonding_mode_active == false)
+            do_button_action();
+        
     }
     else if(is_pin_triggered(IRQ_PLUG_DETECTION))
     {
@@ -4849,12 +5457,12 @@ static void evaluate_gpio_pins()
         {
             send_status(BLE_CONN_HANDLE_ALL, STATUS_CHAIN_CONNECTED);
 
-            if(m_factory_condition == false && m_current_locking_state_chain != STATUS_MOTOR_CLOSED && m_chain_temp_disabled == false)
+            if(m_factory_condition == false && m_current_locking_state_chain != STATUS_MOTOR_2_CLOSED && m_chain_temp_disabled == false)
             {
-                if(m_current_locking_state == STATUS_ALARM_ARMED)
+                if(m_current_locking_state == STATUS_MOTOR_1_CLOSED)
                 {
                     alarmcheck_stop();
-                    m_current_locking_state = STATUS_ALARM_UNARMED;
+                    m_current_locking_state = STATUS_MOTOR_1_OPENED;
                 }
 
                 if(ili_motorcontroller_get_state() == MOTOR_STOP)
@@ -4867,7 +5475,7 @@ static void evaluate_gpio_pins()
         }
         else
         {
-            if(m_current_locking_state_chain != STATUS_MOTOR_CLOSED)
+            if(m_current_locking_state_chain != STATUS_MOTOR_2_CLOSED)
                 send_status(BLE_CONN_HANDLE_ALL, STATUS_CHAIN_REMOVED);
     
             m_chain_temp_disabled = true;
@@ -4875,7 +5483,15 @@ static void evaluate_gpio_pins()
             k_timer_start(&m_plug_reactivation_timer, PLUG_REACTIVATION_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
         }
     }
-    else if(is_pin_triggered(IRQ_MOTOR_OPENED))
+    else if(is_pin_triggered(IRQ_MOTOR_1_OPENED))
+    {
+        LOG_DBG("IRQ_MOTOR_1_OPENED");
+    }
+    else if(is_pin_triggered(IRQ_MOTOR_1_CLOSED))
+    {
+        LOG_DBG("IRQ_MOTOR_1_CLOSED");
+    }
+    else if(is_pin_triggered(IRQ_MOTOR_2_OPENED))
     {
         LOG_DBG("IRQ_MOTOR_OPENED");
 
@@ -4883,7 +5499,7 @@ static void evaluate_gpio_pins()
 
         beep_start(ILI_PIEZO_SOUND_DISARMED);
 
-        m_current_locking_state_chain = STATUS_MOTOR_OPENED;
+        m_current_locking_state_chain = STATUS_MOTOR_2_OPENED;
         send_status(BLE_CONN_HANDLE_ALL, m_current_locking_state_chain);
         send_status(BLE_CONN_HANDLE_ALL, m_current_locking_state);
 
@@ -4894,7 +5510,7 @@ static void evaluate_gpio_pins()
             m_start_factory_reset = true;
 
         // Wenn nur die Kette geöffnet und nicht der Alarm beendet wurde
-        if(m_current_locking_state == STATUS_ALARM_ARMED)
+        if(m_current_locking_state == STATUS_MOTOR_1_CLOSED)
         {
             // Einige Sekunden warten, bis der Alarm wieder aktiviert wird
             k_timer_start(&m_alarm_restart_timer, FIVE_SEC_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
@@ -4902,7 +5518,7 @@ static void evaluate_gpio_pins()
 
         LOG_DBG("Battery level: %d", ili_motorcontroller_get_battery_level());
     }    
-    else if(is_pin_triggered(IRQ_MOTOR_CLOSED))
+    else if(is_pin_triggered(IRQ_MOTOR_2_CLOSED))
     {
         LOG_DBG("IRQ_MOTOR_CLOSED");
 
@@ -4910,14 +5526,14 @@ static void evaluate_gpio_pins()
         beep_start(ILI_PIEZO_SOUND_ARMED);
 
         // Schließzustand setzen und an App übertragen
-        m_current_locking_state_chain = STATUS_MOTOR_CLOSED;
+        m_current_locking_state_chain = STATUS_MOTOR_2_CLOSED;
         send_status(BLE_CONN_HANDLE_ALL, m_current_locking_state_chain);
         send_status(BLE_CONN_HANDLE_ALL, m_current_locking_state);
 
         // Schließzustand im RAM ablegen
         k_work_submit(&work_retention_write);
 
-        m_current_locking_state = STATUS_ALARM_ARMED;
+        m_current_locking_state = STATUS_MOTOR_1_CLOSED;
         alarmcheck_start();
     }
     else if(is_pin_triggered(IRQ_ACC_ALARM))
@@ -4969,77 +5585,14 @@ static void evaluate_gpio_pins()
             }
         }
     }
-    else if(is_pin_triggered(IRQ_ACC_COLORCODE))
+    else if(is_pin_triggered(IRQ_ACC_RELOCK))
     {
-        LOG_DBG("IRQ_ACC_COLORCODE");
-
-        static uint32_t now = 0;
         
-        now = k_uptime_get();
-
-        // Durch Setzen des neuen Zeitpunkts wird die Auswertung des Taps
-        // in der Hauptschleife verzögert
-        m_last_tap_time = now;
-
-        // Ersten Tap registrieren
-        if(m_first_tap_waiting == false)
-        {
-            //LOG_DBG("erster Tap erkannt");
-            // Flag setzen, um Tap in Hauptschleife auszuwerten, 
-            // wenn bis dahin keine weitere Bewegung erfolgt
-            m_first_tap_waiting = true;
-            m_tap_error_counter = 0;
-        }
-        else
-        {
-            // Nach dem ersten Tap werden weitere Taps als Fehler registriert
-            // Wenn es davon zuviele gibt wird die Farbcode-Eingabe abgebrochen
-            m_tap_error_counter++;
-
-            LOG_DBG("m_tap_error_counter = %d", m_tap_error_counter);
-
-            // Zu viel Bewegung erkannt -> Farbcode-Eingabe wird abgebrochen
-            if(m_tap_error_counter > TAP_ERROR_THRESHOLD)
-            {
-                // rote LED blinken lassen 
-                led_timed(LED_R, LED_ERROR);
-                abort_colorcode_input();
-            }
-        }
-
-        // weiteres Tippen erfassen
-        accelerometer_sniff();
-    }
-    else if(is_pin_triggered(IRQ_SINGLE_TAP_DETECTED))
-    {
-        LOG_DBG("IRQ_SINGLE_TAP_DETECTED");
-
-        m_first_tap_waiting = false;
-
-        m_selected_color = (++m_selected_color) % 4;
-
-        switch(m_selected_color)
-        {
-            case 0:
-                led(LED_G);
-            break;
-               
-            case 1:
-                led(LED_B);
-            break;
-                 
-            case 2:
-                led(LED_R);
-            break;
-                   
-            case 3:
-               led(LED_W);
-            break;
-        }
-        LOG_DBG("m_colorcode_in[%d] = %d", m_colorcode_in_index, m_selected_color);
         
-        // Timer zur Bestätigung der Eingabe neu starten
-        k_timer_start(&m_colorcode_input_timer, K_MSEC(1500), SINGLE_SHOT_TIMEOUT);
+        if(m_relock_state == RELOCK_INACTIVE)
+            return;
+        
+        LOG_DBG("IRQ_ACC_RELOCK");
     }
     else
     {
@@ -5101,8 +5654,6 @@ void factory_reset()
 void abort_colorcode_input()
 {
     LOG_DBG("abort_colorcode_input");
-    // Tap-Erkennung beenden
-    m_tap_error_counter = 0;
 
     k_timer_stop(&m_colorcode_input_timer);
     k_timer_stop(&m_colorcode_timeout_timer);
@@ -5419,7 +5970,7 @@ enum mgmt_cb_return mcumgr_dfu_handler(uint32_t event, enum mgmt_cb_return prev_
             LOG_DBG("MGMT_EVT_OP_IMG_MGMT_DFU_CHUNK");
             // Nur ein autorisierter Nutzer verbunden, Batteriestand über 50% und geöffnet
             if(authorised_user_connected() && m_peripheral_conn_count == 1 && ili_motorcontroller_get_battery_level() > 50 
-                && m_current_locking_state_chain == STATUS_MOTOR_OPENED && m_current_locking_state == STATUS_ALARM_UNARMED)
+                && m_current_locking_state_chain == STATUS_MOTOR_2_OPENED && m_current_locking_state == STATUS_MOTOR_1_OPENED)
             {
                 LOG_DBG("DFU started");
                 m_dfu_started = true;
@@ -5457,8 +6008,8 @@ int main(void)
 {
 	int err;
     ssize_t bytes_written = 0;
-    static uint32_t now = 0;
     status_t status_msg;
+    uint8_t gsm_command = 0;
 
 	LOG_INF("===================== %d.%d =====================", FIRMWARE_MAJOR, FIRMWARE_MINOR);
 
@@ -5502,12 +6053,12 @@ int main(void)
     //LOG_INF("lock subvariant = %c", m_uicr_data.subvariant);
     //LOG_INF("hardware version = %d", m_uicr_data.hardware_version);
 
-   // LOG_RAW("Advertising-Name: ");
-   // for(uint8_t i = 0; i < ADV_NAME_LENGTH; i++)
-   // {
-   //     LOG_RAW("%c", m_uicr_data.advertising_name[i]);
-   // }
-   // LOG_RAW("\n");
+    //LOG_RAW("Advertising-Name: ");
+    //for(uint8_t i = 0; i < ADV_NAME_LENGTH; i++)
+    //{
+    //    LOG_RAW("%c", m_uicr_data.advertising_name[i]);
+    //}
+    //LOG_RAW("\n");
     
     LOG_HEXDUMP_INF(m_uicr_data.reset_code, 6, "Click-Code: ");
 
@@ -5598,8 +6149,6 @@ int main(void)
 		LOG_DBG("nicht eingerichtet");
         // Zur Sicherheit wird hier versucht die Settings zu löschen
         zms_delete(&m_filesys, SETTINGS_ID);
-
-        new_bond();
     }
 
     // Batteriestand messen
@@ -5607,7 +6156,12 @@ int main(void)
 
     //ili_piezo_play(ILI_PIEZO_SOUND_ALARM);
 
+     //advertising_start();
 
+     //ili_motorcontroller_start(false);
+m_uicr_data.variant = VARIANT_GPS_4G;
+
+     gsm_send(CMD_STATUS_ALARM);
 TD("TODOs:");
 // https://docs.nordicsemi.com/bundle/ncs-1.7.1/page/zephyr/guides/debug_tools/thread-analyzer.html
 //https://docs.nordicsemi.com/bundle/ncs-2.5.2/page/zephyr/services/pm/device_runtime.html
@@ -5665,6 +6219,13 @@ TD("TODOs:");
         {
             //LOG_DBG("m_triggered_pins = %d", m_triggered_pins);
             evaluate_gpio_pins();
+        }
+
+        // Empfangene UART-Nachricht auswerten
+        if(m_gsm_msg_available)
+        {
+            m_gsm_msg_available = false;
+            evaluate_gsm_msg();
         }
 
         if(m_update_settings)
@@ -5808,68 +6369,14 @@ TD("TODOs:");
             }
         }
 
-        // Während der Farbcode-Eingabe wird hier der Tap bestätigt nachdem die Zeit abgelaufen ist
-        if(m_first_tap_waiting || m_double_tap_waiting)
+        if(m_gsm_send_cmd && ili_gsm_is_receiving() == false && m_update_settings == false)
         {
-            if(m_colorcode_input_active)
+            m_gsm_send_cmd = false;
+            
+            err = k_msgq_peek(&m_gsm_cmd_queue, &gsm_command);
+            if(err == 0)
             {
-                now = k_uptime_get();
-                if(now - m_last_tap_time >= SINGLE_TAP_WINDOW_MS)
-                {
-                    m_triggered_pins |= IRQ_SINGLE_TAP_DETECTED;
-                }
-            }
-            else
-            {
-                now = k_uptime_get();
-
-                if(m_first_tap_waiting)
-                {
-                    if(accelerometer_check_tap(100) == ACC_TAP_DETECTED)
-                    {
-                        LOG_DBG("DOPPELTAP im passenden Bereich");
-                        m_double_tap_waiting = true;
-                        m_last_tap_time = k_uptime_get();
-                    }
-
-                    m_first_tap_waiting = false;
-                    //LOG_DBG("accelerometer_check_tap dauerte %d ms", k_uptime_get() - now);
-                }
-                else if(m_double_tap_waiting && now - m_last_tap_time > DOUBLE_TAP_PROOF_TIME_MS)
-                {
-                    m_double_tap_waiting = false;
-
-                    // if(m_fmna_user_pairing_active)
-                    // {
-                    //     // Doppeltap signalisieren
-                    //     led_timed(LED_W, LED_DOUBLE_TAP);
-                    //     // Work starten, die alle 5 Sek. die Position des NEOs überprüft
-                    //     k_work_schedule(&work_start_fmna_pairing, K_SECONDS(5));
-
-                    //     // Beschleunigungssensor und Interrupt deaktivieren
-                    //     accelerometer_sleep();
-                    //     gpio_remove_callback(pin_accel_int1.port, &accel_int1_cb_data);
-                    // }
-                    // else
-                    {
-                        if(authorised_user_is_nearby())
-                        {
-                            LOG_DBG("Entsperren durch Doppeltap");
-                            set_motion_detection(false);
-                        }
-                        else
-                        {
-                            LOG_DBG("Farbcode-Eingabe aktiv");
-                            led_timed(LED_W, LED_DOUBLE_TAP);
-
-                            // Farbcode-Eingabe aktivieren
-                            m_colorcode_input_active = true;
-                            // Timer für die Eingabe des Farbcodes starten
-                            // Für jede Stelle im Farbcode hat man 10 Sek. Zeit
-                            k_timer_start(&m_colorcode_timeout_timer, TEN_SEC_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
-                        }
-                    }
-                }
+                uart_gsm_send(gsm_command);
             }
         }
 

@@ -44,10 +44,15 @@
 
 ////////// STATUSCODES ////////////
 #define STATUS_SUCCESS                      0x00
-#define	STATUS_ALARM_ARMED                  0x02
-#define STATUS_ALARM_ARM_MOVED              0x04
+#define STATUS_MOTOR_1_CLOSING              0x01
+#define	STATUS_MOTOR_1_CLOSED               0x02
+#define STATUS_MOTOR_1_CLOSE_BLOCKED        0x03
+#define STATUS_MOTOR_1_CLOSE_MOVED          0x04
 #define STATUS_APP_MOVEMENT                 0x05
-#define STATUS_ALARM_UNARMED                0x0B
+#define STATUS_MOTOR_1_OPENING              0x0A
+#define STATUS_MOTOR_1_OPENED               0x0B
+#define STATUS_MOTOR_1_OPEN_BLOCKED         0x0C
+#define STATUS_MOTOR_1_LOCK_STATE_UNKNOWN   0x0F
 #define STATUS_ALARM_ON                     0x10
 #define STATUS_ALARM_OFF                    0x20
 #define STATUS_BOND_COMPLETE                0x30
@@ -77,14 +82,15 @@
 #define STATUS_ERR_WRONG_COUNTER            0x9A
 #define STATUS_ERR_ENTER_DFU_FAILED         0x9B
 #define STATUS_ERR_DFU_TOO_MANY_CONNECTIONS 0x9C
-#define STATUS_ERR_ACC_SELFTEST_FAILED      0x9C
-#define STATUS_MOTOR_CLOSING                0xB1
-#define	STATUS_MOTOR_CLOSED                 0xB2
-#define STATUS_MOTOR_CLOSE_BLOCKED          0xB3
-#define STATUS_MOTOR_OPENING                0xBA
-#define STATUS_MOTOR_OPENED                 0xBB
-#define STATUS_MOTOR_OPEN_BLOCKED           0xBC
-#define	STATUS_MOTOR_LOCK_STATE_UNKNOWN     0xBF
+#define STATUS_ERR_ACC_SELFTEST_FAILED      0x9D
+#define STATUS_ERR_BONDING_ACTIVE           0x9E
+#define STATUS_MOTOR_2_CLOSING              0xB1
+#define	STATUS_MOTOR_2_CLOSED               0xB2
+#define STATUS_MOTOR_2_CLOSE_BLOCKED        0xB3
+#define STATUS_MOTOR_2_OPENING              0xBA
+#define STATUS_MOTOR_2_OPENED               0xBB
+#define STATUS_MOTOR_2_OPEN_BLOCKED         0xBC
+#define	STATUS_MOTOR_2_LOCK_STATE_UNKNOWN   0xBF
 #define STATUS_EMPTY                        0xFF
 
 ////////// Befehlsargumente ////////////
@@ -127,6 +133,8 @@
 #define CMD_RFID_RESP                       0x1B
 #define CMD_LOCKING_CHALLENGE               0x1C
 #define CMD_LOCKING_RESP                    0x1D
+#define CMD_THEFT_RESP                      0x1E
+#define CMD_INFO_B2C                        0x1F
 
 #define CMD_CONF_ALARM                      0x20
 #define CMD_CONF_ALARM_MODE                 0x21
@@ -169,6 +177,7 @@
 #define CMD_STATUS_TRACK_ALL                0x4A
 #define CMD_STATUS_TRACK_LPW                0x4B
 #define CMD_STATUS_OPENED_BUTTON            0x4C
+#define CMD_STATUS_NOT_STOLEN               0x60
 
 #define CMD_TESTMODE_DATA_REQ               0x50
 #define CMD_TESTMODE_DATA_RESP              0x51
