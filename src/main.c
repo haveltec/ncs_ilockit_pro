@@ -532,12 +532,10 @@ static K_SEM_DEFINE(m_uart_tx_sem, 1, 1);                           // Gibt an, 
 
 static uint8_t          m_uart_rx_buf[2][GSM_RX_BUFF_SIZE];         // Doppelpuffer für den Empfang per DMA
 static uint8_t          m_uart_rx_buf_index = 0;                    // Index des Puffers, der dem Treiber zuletzt übergeben wurde
-static uint8_t          m_uart_rx_line[UART_RX_LINE_SIZE];          // Puffer zum Zusammensetzen einer Nachricht (wird im Interrupt gefüllt)
+static uint8_t          m_uart_rx_line[UART_RX_BUF_SIZE];           // Puffer zum Zusammensetzen einer Nachricht (wird im Interrupt gefüllt)
 static uint16_t         m_uart_rx_line_len = 0;                     // Anzahl der Zeichen in m_uart_rx_line
-static bool             m_uart_rx_overflow = false;                 // Gibt an, ob die aktuelle Nachricht zu lang ist und verworfen wird
-static uint8_t          m_uart_rx_message[UART_RX_LINE_SIZE];       // Vollständig empfangene Nachricht für die Auswertung in der Main-Schleife
+static uint8_t          m_uart_rx_message[UART_RX_BUF_SIZE];        // Vollständig empfangene Nachricht für die Auswertung in der Main-Schleife
 static uint16_t         m_uart_rx_message_len = 0;                  // Länge der Nachricht in m_uart_rx_message
-static volatile bool    m_uart_data_received = false;               // Flag, das angibt, ob eine neue Nachricht empfangen wurde
 
 //////////////////////////////////////////////////////////////
 //                     GSM / GPS                            //
@@ -4880,6 +4878,25 @@ static void wdt_init()
 //////////////////////////////////////////////////////////////
 //                         UART                             //
 //////////////////////////////////////////////////////////////
+/**@brief Startet den UART-Empfang nach einem Fehler erneut.
+ *
+ * Wird aus dem UART_RX_DISABLED-Ereignis heraus verzögert eingeplant.
+ */
+static void uart_rx_restart_handler(struct k_work* work)
+{
+    if(m_gps_active == false)
+        return;
+
+    m_uart_rx_buf_index = 0;
+
+    int err = uart_rx_enable(m_uart, m_uart_rx_buf[m_uart_rx_buf_index],
+                             GSM_RX_BUFF_SIZE, RECEIVE_TIMEOUT);
+    if(err && err != -EBUSY)
+        LOG_ERR("uart_rx_enable (restart) = %d", err);
+}
+K_WORK_DELAYABLE_DEFINE(work_uart_rx_restart, uart_rx_restart_handler);
+
+
 /**@brief Funktion zum Aktivieren des GPS-Moduls.
  */
 static void gps_on()
@@ -4934,10 +4951,17 @@ static void gps_off()
         {
             // Befehlsqueue leeren und Timer zum Senden stoppen
             k_timer_stop(&m_gsm_send_timer);
-            k_free(&m_gsm_cmd_queue);
+            // m_gsm_cmd_queue ist ein statisches Kernel-Objekt (K_MSGQ_DEFINE),
+            // darf also nicht mit k_free() freigegeben werden.
+            k_msgq_purge(&m_gsm_cmd_queue);
             m_gsm_send_cmd = false;
             
             gpio_pin_set_dt(&pin_gps_button, 0);
+
+            // Muss vor uart_rx_disable() gesetzt werden, damit das
+            // UART_RX_DISABLED-Ereignis den Empfang nicht neu startet.
+            m_gps_active = false;
+            k_work_cancel_delayable(&work_uart_rx_restart);
 
             uart_tx_abort(m_uart);    // laufenden Sendevorgang abbrechen
             uart_rx_disable(m_uart);  // Empfang beenden
@@ -5364,8 +5388,31 @@ static void uart_evt_handler(const struct device* dev, struct uart_event* evt, v
             break;
 
         case UART_RX_RDY:
-            
-            break;
+        {
+            // Empfangene Bytes einzeln an den Parser weiterreichen
+            const uint8_t* p_data = &evt->data.rx.buf[evt->data.rx.offset];
+
+            for(size_t i = 0; i < evt->data.rx.len; i++)
+            {
+                uint32_t ret = ili_receive_gsm_msg(p_data[i], m_uart_rx_line, &m_uart_rx_line_len);
+
+                if(ret == PARSER_MESSAGE_COMPLETE)
+                {
+                    // Nachricht sichern, damit sie in der Main-Schleife ausgewertet werden kann
+                    if(m_gsm_msg_available == false && m_uart_rx_line_len <= sizeof(m_uart_rx_message))
+                    {
+                        memcpy(m_uart_rx_message, m_uart_rx_line, m_uart_rx_line_len);
+                        m_uart_rx_message_len = m_uart_rx_line_len;
+                        m_gsm_msg_available = true;
+                    }
+                    else
+                    {
+                        LOG_WRN("GSM-Nachricht verworfen (len = %d)", m_uart_rx_line_len);
+                    }
+                }
+            }
+        }
+        break;
 
         case UART_RX_BUF_REQUEST:
         {
@@ -5388,6 +5435,14 @@ static void uart_evt_handler(const struct device* dev, struct uart_event* evt, v
         case UART_RX_DISABLED:
         {
             LOG_DBG("UART_RX_DISABLED");
+
+            // Der Treiber schaltet den Empfang nach jedem Fehler ab.
+            // Solange das GPS-Modul aktiv ist, muss der Empfang wieder
+            // gestartet werden, sonst wird nie wieder etwas empfangen.
+            // Der Neustart laeuft verzoegert ueber die Workqueue, damit ein
+            // dauerhaft gestoerter RX-Pin keine Endlosschleife im ISR erzeugt.
+            if(m_gps_active)
+                k_work_schedule(&work_uart_rx_restart, K_MSEC(50));
         }
         break;
 
@@ -6159,9 +6214,7 @@ int main(void)
      //advertising_start();
 
      //ili_motorcontroller_start(false);
-m_uicr_data.variant = VARIANT_GPS_4G;
 
-     gsm_send(CMD_STATUS_ALARM);
 TD("TODOs:");
 // https://docs.nordicsemi.com/bundle/ncs-1.7.1/page/zephyr/guides/debug_tools/thread-analyzer.html
 //https://docs.nordicsemi.com/bundle/ncs-2.5.2/page/zephyr/services/pm/device_runtime.html
@@ -6224,8 +6277,14 @@ TD("TODOs:");
         // Empfangene UART-Nachricht auswerten
         if(m_gsm_msg_available)
         {
+            LOG_HEXDUMP_DBG(m_uart_rx_message, m_uart_rx_message_len, "GSM RX: ");
+
+            if(ili_parse_gsm_msg(m_uart_rx_message, m_uart_rx_message_len, &m_gsm_message_in) == PARSER_SUCCESS)
+                evaluate_gsm_msg();
+            else
+                LOG_WRN("ili_parse_gsm_msg fehlgeschlagen");
+
             m_gsm_msg_available = false;
-            evaluate_gsm_msg();
         }
 
         if(m_update_settings)

@@ -189,8 +189,8 @@
 
 //////////// UART-Konfiguration ////////////
 #define GSM_TX_BUFF_SIZE 128
-#define GSM_RX_BUFF_SIZE 10
-#define RECEIVE_TIMEOUT 100                                                             /**< Inaktivitäts-Timeout des Empfangs in µs, danach meldet der Treiber den Puffer per UART_RX_RDY. */
+#define GSM_RX_BUFF_SIZE 64
+#define RECEIVE_TIMEOUT 10000                                                           /**< Inaktivitäts-Timeout des Empfangs in µs, danach meldet der Treiber den Puffer per UART_RX_RDY. Muss deutlich > 1 Zeichendauer sein (9600 Baud -> 1,04 ms). */
 #define UART_RX_LINE_SIZE 128                                                           /**< Maximale Länge einer zusammengesetzten Empfangsnachricht (ohne Zeilenende). */
 #define UART_TX_TIMEOUT_US 100000                                                       /**< Timeout für einen Sendevorgang in µs (100 ms). */
 
