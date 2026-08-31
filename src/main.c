@@ -33,6 +33,8 @@
 #include <zephyr/storage/flash_map.h>
 #include <zephyr/fs/zms.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/drivers/can.h>
+#include <zephyr/drivers/spi.h>
 #include <zephyr/retention/retention.h>
 #include <zephyr/drivers/watchdog.h>
 #include <zephyr/pm/device.h>
@@ -456,6 +458,7 @@ static const struct gpio_dt_spec pin_charge = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE,
 static const struct gpio_dt_spec pin_accel_int1 = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, accel_int1_gpios);
 static const struct gpio_dt_spec pin_gps_enable = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, gps_enable_gpios);
 static const struct gpio_dt_spec pin_gps_button = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, fe_enable_gpios);
+static const struct gpio_dt_spec pin_plug_detection = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, plug_detection_gpios);
 
 
 static struct gpio_callback accel_int1_cb_data;
@@ -523,6 +526,496 @@ const struct device *const  m_watchdog = DEVICE_DT_GET(DT_ALIAS(watchdog0));
 int                         m_wdt_channel_id = 0;
 
 //////////////////////////////////////////////////////////////
+//                     CAN (Bringup-Test)                   //
+//////////////////////////////////////////////////////////////
+#if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(can_controller))
+
+// Periodisch einen Testframe senden (1 Hz). Zum Abschalten auf 0 setzen.
+#define CAN_TEST_PERIODIC_TX    1
+#define CAN_TEST_TX_ID          0x123
+#define CAN_TEST_RX_FILTER_ID   0x000   // mit Maske 0 -> alle IDs annehmen
+
+/*
+ * Interner Loopback: der Controller empfaengt seine eigenen Frames und braucht
+ * kein ACK vom Bus. Fuer den ersten Test ohne zweiten Busteilnehmer auf 1
+ * setzen - dann muss zu jedem "CAN TX ok" ein "CAN RX" im Log kommen.
+ * Achtung: im Loopback treibt der Controller den Bus nicht.
+ */
+#define CAN_TEST_LOOPBACK       1
+
+/*
+ * SPI-Selbsttest des nRF: auf 1 setzen und MOSI (P2.04) mit MISO (P2.02)
+ * bruecken. Kommt das gesendete Muster zurueck, arbeitet SPIM00 korrekt und
+ * der Fehler liegt hinter dem nRF-Pin. Kommen Nullen, taktet die SPIM nicht.
+ */
+#define CAN_TEST_SPI_SELFTEST   0
+
+/*
+ * Statischer CS-Test: haelt nCS je 5 s auf High und auf Low, damit der Pegel
+ * mit einem Multimeter nachgemessen werden kann (kein Scope-Trigger noetig).
+ */
+#define CAN_TEST_CS_CHECK       0
+
+static const struct device *const m_can = DEVICE_DT_GET(DT_NODELABEL(can_controller));
+
+/*
+ * Zweiter SPI-Handle auf denselben Baustein (gleicher Bus, gleiches CS) - noetig,
+ * weil der Zephyr-mcp251xfd-Treiber die beiden Controller-GPIOs nicht als
+ * GPIO-Controller nach aussen gibt. Der SPI-Bus serialisiert die Zugriffe, und
+ * das IOCON-Register wird vom Treiber nur einmal beim Init geschrieben - ein
+ * spaeterer Schreibzugriff von hier ist damit stabil.
+ */
+static const struct spi_dt_spec m_can_spi =
+    SPI_DT_SPEC_GET(DT_NODELABEL(can_controller), SPI_WORD_SET(8), 0);
+
+#define MCP251XFD_SPI_INSTR_RESET   0x0000
+#define MCP251XFD_SPI_INSTR_WRITE   0x2000
+#define MCP251XFD_SPI_INSTR_READ    0x3000
+#define MCP251XFD_ADDR_CON          0x0000
+#define MCP251XFD_ADDR_OSC          0x0E00
+#define MCP251XFD_ADDR_IOCON        0x0E04
+#define MCP251XFD_IOCON_PM0         BIT(24)     // GPIO0 als GPIO (statt INT0)
+#define MCP251XFD_IOCON_PM1         BIT(25)     // GPIO1 als GPIO (statt INT1)
+#define MCP251XFD_IOCON_TRIS0       BIT(0)      // 1 = Eingang, 0 = Ausgang
+#define MCP251XFD_IOCON_TRIS1       BIT(1)
+#define MCP251XFD_IOCON_LAT0        BIT(8)      // Ausgangspegel GPIO0
+#define MCP251XFD_IOCON_LAT1        BIT(9)      // Ausgangspegel GPIO1
+
+
+/**@brief   Schaltet den CAN-Transceiver aktiv.
+ *
+ * GPIO0 -> SHDN (active high), GPIO1 -> STB (active high). Beide werden als
+ * Ausgang konfiguriert und auf Low gelegt, damit der Transceiver weder im
+ * Shutdown noch im Standby ist.
+ *
+ * Der Treiber laesst beide Pins nach dem Init als Eingang (TRIS=1) stehen; die
+ * internen Pull-downs des Transceivers wuerden zwar auch Low ergeben, aber ein
+ * aktiv getriebener Pegel ist eindeutig.
+ */
+static int can_transceiver_enable(void)
+{
+    uint8_t tx[2 + 4];
+    uint32_t iocon;
+
+    // GPIO-Modus, beide als Ausgang (TRIS = 0), beide Low (LAT = 0)
+    iocon = MCP251XFD_IOCON_PM0 | MCP251XFD_IOCON_PM1;
+
+    sys_put_be16(MCP251XFD_SPI_INSTR_WRITE | MCP251XFD_ADDR_IOCON, &tx[0]);
+    sys_put_le32(iocon, &tx[2]);
+
+    const struct spi_buf     buf     = { .buf = tx, .len = sizeof(tx) };
+    const struct spi_buf_set buf_set = { .buffers = &buf, .count = 1 };
+
+    int err = spi_write_dt(&m_can_spi, &buf_set);
+    if(err)
+    {
+        LOG_ERR("CAN: IOCON schreiben fehlgeschlagen (err %d)", err);
+        return err;
+    }
+
+    LOG_INF("CAN: Transceiver aktiv (SHDN=0, STB=0, IOCON=0x%.8X)", iocon);
+    return 0;
+}
+
+
+/**@brief   Liest ein 32-Bit-Register des MCP2518FD roh per SPI (ohne CRC).
+ *
+ * @param[in]  addr     Registeradresse
+ * @param[out] p_value  gelesener Registerwert
+ * @param[out] p_raw    die 6 rohen SPI-Bytes (Kommando-Echo + Daten), darf NULL sein
+ */
+static int can_probe_read_reg(uint16_t addr, uint32_t* p_value, uint8_t* p_raw)
+{
+    uint8_t tx[6] = {0};
+    uint8_t rx[6] = {0};
+
+    sys_put_be16(MCP251XFD_SPI_INSTR_READ | addr, &tx[0]);
+
+    const struct spi_buf     tx_buf     = { .buf = tx, .len = sizeof(tx) };
+    const struct spi_buf_set tx_buf_set = { .buffers = &tx_buf, .count = 1 };
+    const struct spi_buf     rx_buf     = { .buf = rx, .len = sizeof(rx) };
+    const struct spi_buf_set rx_buf_set = { .buffers = &rx_buf, .count = 1 };
+
+    int err = spi_transceive_dt(&m_can_spi, &tx_buf_set, &rx_buf_set);
+    if(err)
+        return err;
+
+    if(p_raw != NULL)
+        memcpy(p_raw, rx, sizeof(rx));
+
+    *p_value = sys_get_le32(&rx[2]);
+    return 0;
+}
+
+
+/**@brief   Haelt nCS statisch, damit der Pegel gemessen werden kann.
+ *
+ * Erwartet wird: deassertiert = HIGH (~3,3 V), assertiert = LOW (~0 V).
+ * Misst Du es umgekehrt, sitzt zwischen nRF und MCP2518FD ein Inverter
+ * oder die Leitung ist nicht die, die wir glauben.
+ */
+static void can_test_cs_check(void)
+{
+    const struct gpio_dt_spec* cs = &m_can_spi.config.cs.gpio;
+
+    if(!gpio_is_ready_dt(cs))
+    {
+        LOG_ERR("CS-GPIO nicht bereit");
+        return;
+    }
+
+    // Port und Pin ausgeben - so ist eindeutig, welche Leitung wir treiben
+    LOG_INF("CS-Test: Port %s, Pin %d, active_low = %d",
+            cs->port->name, cs->pin,
+            (cs->dt_flags & GPIO_ACTIVE_LOW) ? 1 : 0);
+
+    // Unabhaengig vom SPI-Treiber selbst als Ausgang konfigurieren
+    int err = gpio_pin_configure_dt(cs, GPIO_OUTPUT_INACTIVE);
+    if(err)
+    {
+        LOG_ERR("gpio_pin_configure_dt = %d -> Pin laesst sich nicht als Ausgang setzen", err);
+        return;
+    }
+
+    // Erst ein paar schnelle Wechsel, damit man am Oszilloskop triggern kann
+    for(uint8_t i = 0; i < 20; i++)
+    {
+        gpio_pin_toggle_dt(cs);
+        k_msleep(50);
+    }
+
+    gpio_pin_set_dt(cs, 0);   // logisch inaktiv
+    k_msleep(1);
+    LOG_INF("CS DEASSERTIERT - erwartet ~3,3 V, Rueckmeldung Pin = %d (5 s)",
+            gpio_pin_get_dt(cs));
+    k_msleep(5000);
+
+    gpio_pin_set_dt(cs, 1);   // logisch aktiv
+    k_msleep(1);
+    LOG_INF("CS ASSERTIERT - erwartet ~0 V, Rueckmeldung Pin = %d (5 s)",
+            gpio_pin_get_dt(cs));
+    k_msleep(5000);
+
+    gpio_pin_set_dt(cs, 0);
+    LOG_INF("CS wieder deassertiert (Ruhezustand)");
+
+    /*
+     * Netz-Charakterisierung an der nRF-Seite: haelt die Leitung ihren Pegel,
+     * wenn der Treiber loslaesst? Das beantwortet ohne Oszilloskop, ob der
+     * nRF-Pin selbst hochohmig wird oder ob das Netz von aussen gezogen wird.
+     */
+    LOG_INF("-- Netztest P2.05 --");
+
+    // Hart auf High treiben, dann loslassen und schauen, was bleibt
+    gpio_pin_configure_dt(cs, GPIO_OUTPUT_ACTIVE);   // active_low -> physikalisch Low
+    gpio_pin_set_dt(cs, 0);                          // logisch inaktiv -> physikalisch High
+    k_msleep(10);
+
+    gpio_pin_configure_dt(cs, GPIO_INPUT);           // loslassen, kein Pull
+    k_busy_wait(50);
+    int v_50us = gpio_pin_get_dt(cs);
+    k_msleep(10);
+    int v_10ms = gpio_pin_get_dt(cs);
+
+    LOG_INF("nach High + loslassen: 50us = %d, 10ms = %d (logisch, active_low)", v_50us, v_10ms);
+
+    gpio_pin_configure_dt(cs, GPIO_INPUT | GPIO_PULL_UP);
+    k_msleep(5);
+    LOG_INF("mit Pull-up:   %d", gpio_pin_get_dt(cs));
+
+    gpio_pin_configure_dt(cs, GPIO_INPUT | GPIO_PULL_DOWN);
+    k_msleep(5);
+    LOG_INF("mit Pull-down: %d", gpio_pin_get_dt(cs));
+
+    LOG_INF("Deutung: haelt die Leitung nach dem Loslassen High und folgt sie");
+    LOG_INF("den Pulls, ist das Netz am nRF frei -> Unterbrechung Richtung MCP.");
+    LOG_INF("Bleibt sie trotz Pull-up Low, zieht etwas am nRF-Netz nach Masse.");
+
+    /*
+     * Roh-Test ohne active_low-Logik: gpio_pin_set_raw(0) MUSS 0 V ergeben,
+     * gpio_pin_set_raw(1) MUSS 3,3 V ergeben. Laeuft in einer Schleife, damit
+     * der Pin mit dem Multimeter gesucht und geprueft werden kann.
+     */
+    LOG_INF("-- Roh-Test P2.05, 6 Durchlaeufe a 10 s --");
+
+    gpio_pin_configure(cs->port, cs->pin, GPIO_OUTPUT);
+
+    for(uint8_t i = 0; i < 6; i++)
+    {
+        gpio_pin_set_raw(cs->port, cs->pin, 0);
+        LOG_INF("[%d/6] RAW LOW  - am Pin muessen 0 V liegen (5 s)", i + 1);
+        k_msleep(5000);
+
+        gpio_pin_set_raw(cs->port, cs->pin, 1);
+        LOG_INF("[%d/6] RAW HIGH - am Pin muessen 3,3 V liegen (5 s)", i + 1);
+        k_msleep(5000);
+    }
+
+    LOG_INF("-- Roh-Test beendet --");
+
+    // Pin wieder als CS-Ausgang hinterlassen
+    gpio_pin_configure_dt(cs, GPIO_OUTPUT_INACTIVE);
+}
+
+
+/**@brief   Prueft die SPIM-Instanz selbst per Drahtbruecke MOSI -> MISO.
+ *
+ * Unabhaengig vom MCP2518FD: sendet ein Muster und schaut, ob es zurueckkommt.
+ * Voraussetzung ist eine Bruecke zwischen P2.04 (MOSI) und P2.02 (MISO).
+ */
+static void can_test_spi_selftest(void)
+{
+    static const uint8_t pattern[6] = { 0xA5, 0x5A, 0x0F, 0xF0, 0xCC, 0x33 };
+    uint8_t rx[sizeof(pattern)] = {0};
+
+    const struct spi_buf     tx_buf     = { .buf = (void*)pattern, .len = sizeof(pattern) };
+    const struct spi_buf_set tx_buf_set = { .buffers = &tx_buf, .count = 1 };
+    const struct spi_buf     rx_buf     = { .buf = rx, .len = sizeof(rx) };
+    const struct spi_buf_set rx_buf_set = { .buffers = &rx_buf, .count = 1 };
+
+    LOG_INF("SPI-Selbsttest (Bruecke P2.04 -> P2.02 noetig)");
+
+    int err = spi_transceive_dt(&m_can_spi, &tx_buf_set, &rx_buf_set);
+    if(err)
+    {
+        LOG_ERR("spi_transceive = %d", err);
+        return;
+    }
+
+    LOG_HEXDUMP_INF(pattern, sizeof(pattern), "gesendet:  ");
+    LOG_HEXDUMP_INF(rx,      sizeof(rx),      "empfangen: ");
+
+    if(memcmp(pattern, rx, sizeof(pattern)) == 0)
+        LOG_INF("SPIM00 arbeitet korrekt -> Fehler liegt hinter dem nRF-Pin");
+    else
+        LOG_ERR("Muster kam nicht zurueck -> SPIM00/Pinctrl pruefen (oder Bruecke fehlt)");
+}
+
+
+/**@brief   Diagnose, wenn der CAN-Treiber nicht hochkommt.
+ *
+ * Der Treiber meldet den Fehlerfall nicht: der erste Lesezugriff auf den
+ * Baustein liefert NULL und die Init-Funktion gibt still -EIO zurueck.
+ * Diese Sonde spricht den MCP2518FD direkt an und zeigt, was auf MISO
+ * zurueckkommt.
+ */
+static void can_test_probe(void)
+{
+    uint32_t con = 0;
+    uint32_t osc = 0;
+    uint8_t  raw[6];
+
+    LOG_INF("--- CAN-Diagnose ---");
+
+    if(!spi_is_ready_dt(&m_can_spi))
+    {
+        LOG_ERR("SPI-Bus selbst nicht bereit -> Problem liegt im nRF (spi00/pinctrl), nicht am MCP2518FD");
+        return;
+    }
+    LOG_INF("SPI-Bus bereit (%s, %d Hz, CS P2.05)",
+            m_can_spi.bus->name, m_can_spi.config.frequency);
+
+#if CAN_TEST_CS_CHECK
+    can_test_cs_check();
+#endif
+
+#if CAN_TEST_SPI_SELFTEST
+    can_test_spi_selftest();
+    return;
+#endif
+
+    // Reset senden und dem Baustein Zeit geben
+    uint8_t reset_cmd[2];
+    sys_put_be16(MCP251XFD_SPI_INSTR_RESET, reset_cmd);
+
+    const struct spi_buf     rb  = { .buf = reset_cmd, .len = sizeof(reset_cmd) };
+    const struct spi_buf_set rbs = { .buffers = &rb, .count = 1 };
+
+    int err = spi_write_dt(&m_can_spi, &rbs);
+    if(err)
+    {
+        LOG_ERR("Reset-Kommando konnte nicht gesendet werden (err %d)", err);
+        return;
+    }
+    k_msleep(10);
+
+    if(can_probe_read_reg(MCP251XFD_ADDR_CON, &con, raw) == 0)
+    {
+        LOG_HEXDUMP_INF(raw, sizeof(raw), "CON roh: ");
+        LOG_INF("CON = 0x%.8X (OPMOD = %d, erwartet 4 = Configuration)",
+                con, (uint8_t)((con >> 24) & 0x07));
+    }
+
+    if(can_probe_read_reg(MCP251XFD_ADDR_OSC, &osc, raw) == 0)
+    {
+        LOG_HEXDUMP_INF(raw, sizeof(raw), "OSC roh: ");
+        LOG_INF("OSC = 0x%.8X (OSCRDY = %d, erwartet 1)",
+                osc, (osc & BIT(10)) ? 1 : 0);
+    }
+
+    if((con == 0x00000000 && osc == 0x00000000) || (con == 0xFFFFFFFF && osc == 0xFFFFFFFF))
+    {
+        LOG_ERR("Keine Antwort vom Baustein - MISO haengt konstant %s.",
+                (con == 0) ? "Low" : "High");
+        LOG_ERR("Pruefen: Versorgung des MCP2518FD, 20-MHz-Quarz schwingt,");
+        LOG_ERR("MISO/MOSI nicht vertauscht (SDI<-MOSI P2.04, SDO->MISO P2.02),");
+        LOG_ERR("Pegel (VIH des MCP2518FD = 0,8 x VDD).");
+    }
+
+    LOG_INF("--- Ende CAN-Diagnose ---");
+}
+
+
+/**@brief   Callback fuer empfangene CAN-Frames.
+ */
+static void can_test_rx_callback(const struct device *dev, struct can_frame *frame, void *user_data)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(user_data);
+
+    LOG_INF("CAN RX: ID=0x%.3X %s DLC=%d",
+            frame->id,
+            (frame->flags & CAN_FRAME_IDE) ? "ext" : "std",
+            can_dlc_to_bytes(frame->dlc));
+
+    if((frame->flags & CAN_FRAME_RTR) == 0)
+        LOG_HEXDUMP_INF(frame->data, can_dlc_to_bytes(frame->dlc), "CAN RX Daten: ");
+}
+
+
+/**@brief   Callback nach abgeschlossenem Sendevorgang.
+ */
+static void can_test_tx_callback(const struct device *dev, int error, void *user_data)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(user_data);
+
+    if(error)
+        LOG_WRN("CAN TX fehlgeschlagen (err %d) - kein ACK? Bus/Transceiver pruefen", error);
+    else
+        LOG_DBG("CAN TX ok");
+}
+
+
+/**@brief   Sendet einen CAN-Frame (Standard-ID, nicht blockierend).
+ *
+ * @param[in] id    11-Bit CAN-ID
+ * @param[in] data  Nutzdaten (darf NULL sein, wenn len = 0)
+ * @param[in] len   Anzahl Nutzdatenbytes, max. 8
+ *
+ * @retval 0 bei Erfolg, sonst negativer Fehlercode
+ */
+int can_test_send(uint16_t id, const uint8_t* data, uint8_t len)
+{
+    struct can_frame frame = {0};
+
+    if(len > 8)
+        return -EINVAL;
+
+    frame.id    = id;
+    frame.dlc   = can_bytes_to_dlc(len);
+    frame.flags = 0;   // Standard-ID, kein RTR, kein CAN-FD
+
+    if(data != NULL && len > 0)
+        memcpy(frame.data, data, len);
+
+    int err = can_send(m_can, &frame, K_NO_WAIT, can_test_tx_callback, NULL);
+    if(err)
+        LOG_ERR("can_send = %d", err);
+    else
+        LOG_DBG("CAN TX: ID=0x%.3X len=%d", id, len);
+
+    return err;
+}
+
+
+#if CAN_TEST_PERIODIC_TX
+static void can_test_tx_handler(struct k_work* work);
+static K_WORK_DELAYABLE_DEFINE(work_can_test_tx, can_test_tx_handler);
+
+static void can_test_tx_handler(struct k_work* work)
+{
+    static uint8_t counter = 0;
+
+    uint8_t payload[8] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, counter++ };
+
+    can_test_send(CAN_TEST_TX_ID, payload, sizeof(payload));
+
+    k_work_schedule(&work_can_test_tx, K_SECONDS(1));
+}
+#endif
+
+
+/**@brief   Initialisiert den CAN-Controller fuer den Bringup-Test.
+ *
+ * Aktiviert den Transceiver, haengt einen Empfangsfilter fuer ALLE IDs ein,
+ * startet den Controller und - falls CAN_TEST_PERIODIC_TX gesetzt ist - den
+ * periodischen Testsender.
+ */
+static int can_test_init(void)
+{
+    int err;
+
+    if(!device_is_ready(m_can))
+    {
+        LOG_ERR("CAN: Controller nicht bereit - Treiber-Init fehlgeschlagen");
+        can_test_probe();
+        return -ENODEV;
+    }
+
+    // Transceiver aus Shutdown/Standby holen, bevor der Bus angefasst wird
+    err = can_transceiver_enable();
+    if(err)
+        return err;
+
+    LOG_INF("CAN: Controller bereit");
+
+    // Empfangsfilter: Maske 0 -> jede Standard-ID wird angenommen
+    const struct can_filter filter =
+    {
+        .id    = CAN_TEST_RX_FILTER_ID,
+        .mask  = 0,
+        .flags = 0,
+    };
+
+    err = can_add_rx_filter(m_can, can_test_rx_callback, NULL, &filter);
+    if(err < 0)
+    {
+        LOG_ERR("can_add_rx_filter = %d", err);
+        return err;
+    }
+
+#if CAN_TEST_LOOPBACK
+    err = can_set_mode(m_can, CAN_MODE_LOOPBACK);
+    if(err)
+    {
+        LOG_ERR("can_set_mode(LOOPBACK) = %d", err);
+        return err;
+    }
+#endif
+
+    err = can_start(m_can);
+    if(err)
+    {
+        LOG_ERR("can_start = %d", err);
+        return err;
+    }
+
+    LOG_INF("CAN: gestartet (250 kbit/s%s)",
+            CAN_TEST_LOOPBACK ? ", interner Loopback" : "");
+
+#if CAN_TEST_PERIODIC_TX
+    k_work_schedule(&work_can_test_tx, K_SECONDS(1));
+    LOG_INF("CAN: periodischer Testsender aktiv (ID 0x%.3X, 1 Hz)", CAN_TEST_TX_ID);
+#endif
+
+    return 0;
+}
+
+#endif /* can_controller okay */
+
+
+//////////////////////////////////////////////////////////////
 //                         UART                             //
 //////////////////////////////////////////////////////////////
 
@@ -541,7 +1034,10 @@ static uint16_t         m_uart_rx_message_len = 0;                  // Länge de
 //                     GSM / GPS                            //
 //////////////////////////////////////////////////////////////
 // UARTE00 ist mit dem GPS-Modul verbunden (TX = P2.08, RX = P2.00, 9600 Baud)
-const struct    device *const  m_uart = DEVICE_DT_GET(DT_NODELABEL(uart00));
+// uart00 teilt sich den Serial-Block mit spi00 (CAN). Ist im Board-DTS
+// spi00 aktiv, ist uart00 deaktiviert und m_uart wird NULL -> alle
+// UART-Pfade werden dann zur Laufzeit uebersprungen.
+const struct    device *const  m_uart = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(uart00));
 K_MSGQ_DEFINE(m_gsm_cmd_queue, sizeof(uint8_t), 5, 4);
 static bool     m_gps_active = false;           // Gibt an, ob das GPS-Modul aktiv ist
 static bool     m_gsm_msg_available = false;    // Gibt an, ob eine komplette Nachricht empfangen wurde
@@ -4573,6 +5069,7 @@ static void plug_evt_handler(button_evt_t evt)
     }
 }
 
+
 static void gpio_init()
 {
     LOG_DBG("gpio_init()");
@@ -4884,7 +5381,7 @@ static void wdt_init()
  */
 static void uart_rx_restart_handler(struct k_work* work)
 {
-    if(m_gps_active == false)
+    if(m_uart == NULL || m_gps_active == false)
         return;
 
     m_uart_rx_buf_index = 0;
@@ -4919,7 +5416,8 @@ static void gps_on()
 
             if(!device_is_ready(m_uart))
             {
-                LOG_ERR("%s: device not ready.", m_uart->name);
+                // m_uart == NULL, wenn uart00 im DTS deaktiviert ist (CAN-Konfiguration)
+                LOG_ERR("uart00 nicht verfuegbar - GSM-Kommunikation deaktiviert");
                 return;
             }
 
@@ -4963,9 +5461,12 @@ static void gps_off()
             m_gps_active = false;
             k_work_cancel_delayable(&work_uart_rx_restart);
 
-            uart_tx_abort(m_uart);    // laufenden Sendevorgang abbrechen
-            uart_rx_disable(m_uart);  // Empfang beenden
-            LOG_DBG("UART uninit");
+            if(m_uart != NULL)
+            {
+                uart_tx_abort(m_uart);    // laufenden Sendevorgang abbrechen
+                uart_rx_disable(m_uart);  // Empfang beenden
+                LOG_DBG("UART uninit");
+            }
             
             // Initialisierung der UART-Pins um Energie zu sparen
             //nrf_gpio_cfg_output(PIN_GSM_TX);
@@ -5224,6 +5725,12 @@ void uart_gsm_send(uint8_t command)
 
     static uint8_t gsm_msg_tx[UART_RX_BUF_SIZE];    
     
+    if(m_uart == NULL)
+    {
+        LOG_DBG("uart00 deaktiviert - nichts gesendet");
+        return;
+    }
+    
     if(m_gps_active == false)
     {
         LOG_DBG("GPS not active");
@@ -5334,6 +5841,9 @@ void uart_gsm_send_ack(uint8_t command)
 {
 	LOG_DBG("uart_gsm_send_ack() - 0x%.2X", command);
 	
+    if(m_uart == NULL)
+        return;
+    
     if(k_sem_take(&m_uart_tx_sem, K_NO_WAIT) != 0)
     {
         LOG_WRN("UART sendet noch");
@@ -6141,6 +6651,11 @@ int main(void)
 
     // Beschleunigungssensor initialisieren
     accelerometer_init(ILI_ACC_STK8321);
+
+#if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(can_controller))
+    // CAN-Bringup-Test (nur aktiv, solange spi00 im DTS eingeschaltet ist)
+    can_test_init();
+#endif
 
     ble_services_init();
 
