@@ -537,11 +537,10 @@ int                         m_wdt_channel_id = 0;
 
 /*
  * Interner Loopback: der Controller empfaengt seine eigenen Frames und braucht
- * kein ACK vom Bus. Fuer den ersten Test ohne zweiten Busteilnehmer auf 1
- * setzen - dann muss zu jedem "CAN TX ok" ein "CAN RX" im Log kommen.
- * Achtung: im Loopback treibt der Controller den Bus nicht.
+ * kein ACK vom Bus. Nur fuer den Test ohne zweiten Busteilnehmer - im Loopback
+ * treibt der Controller den Bus nicht. Fuer echte Kommunikation auf 0 lassen.
  */
-#define CAN_TEST_LOOPBACK       1
+#define CAN_TEST_LOOPBACK       0
 
 /*
  * SPI-Selbsttest des nRF: auf 1 setzen und MOSI (P2.04) mit MISO (P2.02)
@@ -883,6 +882,35 @@ static void can_test_rx_callback(const struct device *dev, struct can_frame *fra
 }
 
 
+/**@brief   Callback bei Aenderung des CAN-Buszustands.
+ *
+ * Am echten Bus die wichtigste Diagnose: fehlende Terminierung, falsche
+ * Bitrate oder ein abwesender Partner zeigen sich hier als steigende
+ * Fehlerzaehler bis hin zu Bus-Off.
+ */
+static void can_test_state_callback(const struct device *dev, enum can_state state,
+                                    struct can_bus_err_cnt err_cnt, void *user_data)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(user_data);
+
+    static const char* const state_names[] =
+    {
+        "ERROR_ACTIVE", "ERROR_WARNING", "ERROR_PASSIVE", "BUS_OFF", "STOPPED"
+    };
+
+    const char* name = (state < ARRAY_SIZE(state_names)) ? state_names[state] : "?";
+
+    if(state == CAN_STATE_ERROR_ACTIVE)
+        LOG_INF("CAN Bus: %s (TX-Err %d, RX-Err %d)", name, err_cnt.tx_err_cnt, err_cnt.rx_err_cnt);
+    else
+        LOG_WRN("CAN Bus: %s (TX-Err %d, RX-Err %d)", name, err_cnt.tx_err_cnt, err_cnt.rx_err_cnt);
+
+    if(state == CAN_STATE_BUS_OFF)
+        LOG_ERR("CAN Bus-Off - Terminierung (2x120 Ohm), Bitrate beider Knoten und Verkabelung pruefen");
+}
+
+
 /**@brief   Callback nach abgeschlossenem Sendevorgang.
  */
 static void can_test_tx_callback(const struct device *dev, int error, void *user_data)
@@ -970,20 +998,38 @@ static int can_test_init(void)
 
     LOG_INF("CAN: Controller bereit");
 
-    // Empfangsfilter: Maske 0 -> jede Standard-ID wird angenommen
-    const struct can_filter filter =
+    // Empfangsfilter: Maske 0 -> jede ID wird angenommen.
+    // Standard- und Extended-IDs brauchen je einen eigenen Filter.
+    const struct can_filter filter_std =
     {
         .id    = CAN_TEST_RX_FILTER_ID,
         .mask  = 0,
         .flags = 0,
     };
 
-    err = can_add_rx_filter(m_can, can_test_rx_callback, NULL, &filter);
+    err = can_add_rx_filter(m_can, can_test_rx_callback, NULL, &filter_std);
     if(err < 0)
     {
-        LOG_ERR("can_add_rx_filter = %d", err);
+        LOG_ERR("can_add_rx_filter (std) = %d", err);
         return err;
     }
+
+    const struct can_filter filter_ext =
+    {
+        .id    = CAN_TEST_RX_FILTER_ID,
+        .mask  = 0,
+        .flags = CAN_FILTER_IDE,
+    };
+
+    err = can_add_rx_filter(m_can, can_test_rx_callback, NULL, &filter_ext);
+    if(err < 0)
+    {
+        LOG_ERR("can_add_rx_filter (ext) = %d", err);
+        return err;
+    }
+
+    // Buszustand ueberwachen (Fehlerzaehler, Bus-Off)
+    can_set_state_change_callback(m_can, can_test_state_callback, NULL);
 
 #if CAN_TEST_LOOPBACK
     err = can_set_mode(m_can, CAN_MODE_LOOPBACK);
