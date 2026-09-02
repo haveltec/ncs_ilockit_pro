@@ -55,10 +55,12 @@
 #include "ili_uicr.h"
 #include "ili_button.h"
 #include "ili_motorcontroller.h"
+#include "ili_battery.h"
 #include "ili_accelerometer.h"
 #include "ili_client.h"
 #include "ili_piezo.h"
 #include "ili_led.h"
+#include "ili_can.h"
 #include "commands.h"
 #include "defines.h"
 
@@ -541,7 +543,17 @@ static uint16_t         m_uart_rx_message_len = 0;                  // Länge de
 //                     GSM / GPS                            //
 //////////////////////////////////////////////////////////////
 // UARTE00 ist mit dem GPS-Modul verbunden (TX = P2.08, RX = P2.00, 9600 Baud)
+//
+// ACHTUNG: UARTE00 und SPIM00 sind derselbe Serial-Block (0x0004A000) - es kann
+// immer nur eines von beidem laufen. Ist im Board-DTS spi00 (CAN) aktiv, ist
+// uart00 zwangslaeufig deaktiviert und es gibt kein GPS-UART. Damit die
+// GPS-Logik trotzdem unveraendert uebersetzt, bleibt m_uart dann NULL; alle
+// UART-Zugriffe pruefen darauf.
+#if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(uart00))
 const struct    device *const  m_uart = DEVICE_DT_GET(DT_NODELABEL(uart00));
+#else
+const struct    device *const  m_uart = NULL;
+#endif
 K_MSGQ_DEFINE(m_gsm_cmd_queue, sizeof(uint8_t), 5, 4);
 static bool     m_gps_active = false;           // Gibt an, ob das GPS-Modul aktiv ist
 static bool     m_gsm_msg_available = false;    // Gibt an, ob eine komplette Nachricht empfangen wurde
@@ -1114,7 +1126,7 @@ static void six_min_timeout_handler(struct k_timer* timer)
     {
         LOG_DBG("Spannung messen");
         m_batt_timeout_counter = 0;
-        //ili_battery_start();
+        ili_battery_start();
     }
 }
 
@@ -4066,7 +4078,7 @@ void usdio_send_data(uint16_t conn_handle, ili_usdio_message_t* message_out)
             // Toneinstellungen
             message_out->payload[14] = m_settings.sound.ble;                    // 1 Byte
             // Batteriestand
-            message_out->payload[15] = ili_motorcontroller_get_battery_level(); // 1 Byte
+            message_out->payload[15] = ili_battery_get_value(); // 1 Byte
             // Farbcode
             memcpy(&message_out->payload[16], m_settings.colorcode_flash, 3);   // 3 Byte
             // Sharing-Code
@@ -4090,14 +4102,14 @@ void usdio_send_data(uint16_t conn_handle, ili_usdio_message_t* message_out)
 		{
             message_out->payload_len = 2;
             message_out->payload[0] = m_current_locking_state;
-            message_out->payload[1] = ili_motorcontroller_get_battery_level();  // 1 Byte
+            message_out->payload[1] = ili_battery_get_value();  // 1 Byte
 		}
 		break; // case LOCK_STATE
         
         case BATT_LEVEL:
         {
             message_out->payload_len = 1;
-            message_out->payload[0] = ili_motorcontroller_get_battery_level();  // 1 Byte
+            message_out->payload[0] = ili_battery_get_value();  // 1 Byte
         }break;
         
         case GPS_UUID:
@@ -4288,6 +4300,10 @@ static void set_motion_detection(bool enable)
         if(m_charge_active == false)
         {
             m_play_batt_warning = true;
+
+            // Batteriestand beim Oeffnen messen. Die Messung laeuft parallel zur
+            // Motorfahrt, es wird also die Spannung unter Last erfasst.
+            ili_battery_start();
         }
 
         m_current_locking_state = STATUS_MOTOR_1_OPENED;
@@ -4496,30 +4512,6 @@ static void motorcontroller_evt_handler(mc_evt_t evt)
         }
         break;
 
-        case MC_BATTERY_FINISHED:
-        {
-            LOG_DBG("MC_BATTERY_FINISHED - %d", ili_motorcontroller_get_battery_level());
-
-            if(ili_motorcontroller_get_battery_level() < BATTERY_LOW)
-            {
-                // Batteriewarnung nur abspielen, wenn die Messung beim Öffnen ausgelöst wurde
-                if(m_play_batt_warning)
-                {
-                    beep_start(ILI_PIEZO_SOUND_LOW_BATT);
-                }
-                
-                send_status(BLE_CONN_HANDLE_ALL, STATUS_BATT_LOW);
-            }
-
-            // Flag für Warnton zurücksetzen
-            m_play_batt_warning = false;
-    
-            // Wenn sich der Batteriestand geändert hat, wird eine Notification an alle verbundenen Geräte gesendet
-            // Die App muss dann den neuen Batteriestand anfragen
-            send_status(BLE_CONN_HANDLE_ALL, STATUS_BATT_CHANGED);
-        }
-        break;
-
         default:
         break;
     }
@@ -4530,6 +4522,36 @@ static void motorcontroller_evt_handler(mc_evt_t evt)
         // Test weiterführen
         m_actual_test++;
         m_test_active = false;
+    }
+}
+
+
+/** @brief Wird aufgerufen, sobald eine Batteriemessung abgeschlossen ist
+ *  @param batt_level_changed true, wenn sich der Batteriestand geändert hat
+*/
+static void battery_finished_handler(bool batt_level_changed)
+{
+    LOG_DBG("battery_finished_handler - %d", ili_battery_get_value());
+
+    if(ili_battery_get_value() < BATTERY_LOW)
+    {
+        // Batteriewarnung nur abspielen, wenn die Messung beim Öffnen ausgelöst wurde
+        if(m_play_batt_warning)
+        {
+            beep_start(ILI_PIEZO_SOUND_LOW_BATT);
+        }
+
+        send_status(BLE_CONN_HANDLE_ALL, STATUS_BATT_LOW);
+    }
+
+    // Flag für Warnton zurücksetzen
+    m_play_batt_warning = false;
+
+    // Wenn sich der Batteriestand geändert hat, wird eine Notification an alle verbundenen Geräte gesendet
+    // Die App muss dann den neuen Batteriestand anfragen
+    if(batt_level_changed)
+    {
+        send_status(BLE_CONN_HANDLE_ALL, STATUS_BATT_CHANGED);
     }
 }
 
@@ -4884,7 +4906,7 @@ static void wdt_init()
  */
 static void uart_rx_restart_handler(struct k_work* work)
 {
-    if(m_gps_active == false)
+    if(m_gps_active == false || m_uart == NULL)
         return;
 
     m_uart_rx_buf_index = 0;
@@ -4916,6 +4938,12 @@ static void gps_on()
             /**
              * @brief Initialisierung des UART und Starten des Empfangs
              */
+
+            if(m_uart == NULL)
+            {
+                LOG_ERR("GPS-UART nicht vorhanden - uart00 ist im DTS deaktiviert (CAN-SPI aktiv)");
+                return;
+            }
 
             if(!device_is_ready(m_uart))
             {
@@ -4963,8 +4991,11 @@ static void gps_off()
             m_gps_active = false;
             k_work_cancel_delayable(&work_uart_rx_restart);
 
-            uart_tx_abort(m_uart);    // laufenden Sendevorgang abbrechen
-            uart_rx_disable(m_uart);  // Empfang beenden
+            if(m_uart != NULL)
+            {
+                uart_tx_abort(m_uart);    // laufenden Sendevorgang abbrechen
+                uart_rx_disable(m_uart);  // Empfang beenden
+            }
             LOG_DBG("UART uninit");
             
             // Initialisierung der UART-Pins um Energie zu sparen
@@ -5317,7 +5348,9 @@ void uart_gsm_send(uint8_t command)
     
     // Pause für Aktivierung des UARTs    
     k_msleep(100);
-    int err = uart_tx(m_uart, gsm_msg_tx, gsm_msg_tx[3] + 6, UART_TX_TIMEOUT_US);
+    int err = (m_uart != NULL)
+              ? uart_tx(m_uart, gsm_msg_tx, gsm_msg_tx[3] + 6, UART_TX_TIMEOUT_US)
+              : -ENODEV;
     if(err)
     {
         LOG_ERR("uart_tx = %d", err);
@@ -5360,7 +5393,9 @@ void uart_gsm_send_ack(uint8_t command)
         gpio_pin_set_dt(&pin_gps_button, 0);
         k_msleep(100);
         
-        int err = uart_tx(m_uart, gsm_msg_tx, 11, UART_TX_TIMEOUT_US);
+        int err = (m_uart != NULL)
+                  ? uart_tx(m_uart, gsm_msg_tx, 11, UART_TX_TIMEOUT_US)
+                  : -ENODEV;
         if(err)
         {
             LOG_ERR("uart_tx = %d", err);
@@ -5483,8 +5518,8 @@ static void evaluate_gpio_pins()
         }
         else
         {
-            ili_motorcontroller_reset_battery_level();
-            ili_motorcontroller_measure_battery();
+            ili_battery_reset();
+            ili_battery_start();
         }
 
         m_charge_active = false;
@@ -5571,7 +5606,7 @@ static void evaluate_gpio_pins()
             k_timer_start(&m_alarm_restart_timer, FIVE_SEC_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
         }
 
-        LOG_DBG("Battery level: %d", ili_motorcontroller_get_battery_level());
+        LOG_DBG("Battery level: %d", ili_battery_get_value());
     }    
     else if(is_pin_triggered(IRQ_MOTOR_2_CLOSED))
     {
@@ -5821,7 +5856,7 @@ void abort_colorcode_input()
 // static void fmna_battery_level_request(void)
 // {
 // 	LOG_DBG("Battery level request");
-//     int err = fmna_battery_level_set(ili_motorcontroller_get_battery_level());
+//     int err = fmna_battery_level_set(ili_battery_get_value());
 // 	if (err) {
 // 		LOG_DBG("fmna_battery_level_set failed (err %d)", err);
 // 	}
@@ -5913,7 +5948,7 @@ void abort_colorcode_input()
 // 		return err;
 // 	}
 
-// 	err = fmna_battery_level_set(ili_motorcontroller_get_battery_level());
+// 	err = fmna_battery_level_set(ili_battery_get_value());
 // 	if (err) {
 // 		LOG_DBG("fmna_battery_level_set failed (err %d)", err);
 // 		return err;
@@ -6024,7 +6059,7 @@ enum mgmt_cb_return mcumgr_dfu_handler(uint32_t event, enum mgmt_cb_return prev_
         {
             LOG_DBG("MGMT_EVT_OP_IMG_MGMT_DFU_CHUNK");
             // Nur ein autorisierter Nutzer verbunden, Batteriestand über 50% und geöffnet
-            if(authorised_user_connected() && m_peripheral_conn_count == 1 && ili_motorcontroller_get_battery_level() > 50 
+            if(authorised_user_connected() && m_peripheral_conn_count == 1 && ili_battery_get_value() > 50 
                 && m_current_locking_state_chain == STATUS_MOTOR_2_OPENED && m_current_locking_state == STATUS_MOTOR_1_OPENED)
             {
                 LOG_DBG("DFU started");
@@ -6136,11 +6171,17 @@ int main(void)
     gpio_init();
 
     ili_motorcontroller_init(motorcontroller_evt_handler);
+
+    // Handler für die Batteriemessung setzen
+    ili_battery_set_handler(battery_finished_handler);
     
     //ili_led_strip_init();
 
     // Beschleunigungssensor initialisieren
     accelerometer_init(ILI_ACC_STK8321);
+
+    // CAN-Controller initialisieren und sofort in den Standby legen
+    ili_can_init();
 
     ble_services_init();
 
@@ -6207,7 +6248,7 @@ int main(void)
     }
 
     // Batteriestand messen
-    //ili_motorcontroller_measure_battery();
+    //ili_battery_start();
 
     //ili_piezo_play(ILI_PIEZO_SOUND_ALARM);
 

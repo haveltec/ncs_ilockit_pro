@@ -32,8 +32,8 @@ target_sources(app PRIVATE ../../libs/motorcontroller/ili_motorcontroller.c)
 target_include_directories(app PRIVATE ../../libs/accelerometer)
 target_sources(app PRIVATE ../../libs/accelerometer/ili_accelerometer.c)
 
-#target_include_directories(app PRIVATE ../../libs/battery)
-#target_sources(app PRIVATE ../../libs/battery/ili_battery.c)
+target_include_directories(app PRIVATE ../../libs/battery)
+target_sources(app PRIVATE ../../libs/battery/ili_battery.c)
 
 target_include_directories(app PRIVATE ../../libs/uicr)
 target_sources(app PRIVATE ../../libs/uicr/ili_uicr.c)
@@ -46,6 +46,9 @@ target_sources(app PRIVATE ../../libs/piezo/ili_piezo.c)
 
 target_include_directories(app PRIVATE ../../libs/led)
 target_sources(app PRIVATE ../../libs/led/ili_led.c)
+
+target_include_directories(app PRIVATE ../../libs/can)
+target_sources(app PRIVATE ../../libs/can/ili_can.c)
 
 
 # NORDIC SDK APP END
