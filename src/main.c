@@ -291,13 +291,11 @@ static void button_timeout_handler(struct k_timer* timer);
 // ADV_TEST_NAME ist der fest vorgegebene Advertising-Name (statt UICR-Name).
 // ---------------------------------------------------------------------------
 #define ADV_TEST_LEGACY     1
-#define ADV_TEST_NAME       "ILI-PRO-TEST"
 
 #if ADV_TEST_LEGACY
 // Advertising-Daten: Flags + vollstaendiger Geraetename
 static const struct bt_data m_adv_data[] = {
-    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-    BT_DATA(BT_DATA_NAME_COMPLETE, ADV_TEST_NAME, sizeof(ADV_TEST_NAME) - 1)
+    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR))
 };
 #else
 static struct bt_le_ext_adv *m_ili_pro_adv_set;
@@ -1853,13 +1851,7 @@ static void ble_services_init()
         m_auth_state[i] = UNAUTHORISED;
 
     // Device-Name setzen
-#if ADV_TEST_LEGACY
-    // Fester Testname, unabhaengig vom UICR-Inhalt
-    int name_err = bt_set_name(ADV_TEST_NAME);
-    LOG_DBG("bt_set_name(\"%s\") = %d", ADV_TEST_NAME, name_err);
-#else
     bt_set_name(m_uicr_data.advertising_name);
-#endif
 }
 
 
@@ -1868,8 +1860,6 @@ static void advertising_init()
 #if ADV_TEST_LEGACY
     // Beim Legacy-Advertising werden Parameter und Daten erst in
     // bt_le_adv_start() uebergeben -> hier ist nichts zu initialisieren.
-    LOG_DBG("advertising_init: Legacy-Advertising, Name = \"%s\" (%d Byte Payload)",
-            ADV_TEST_NAME, 3 + 2 + (int)(sizeof(ADV_TEST_NAME) - 1));
 #else
     int err;
     struct bt_le_adv_param param = {0};
