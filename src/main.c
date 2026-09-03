@@ -173,7 +173,6 @@ typedef enum
     LED_UNLOCKING,
     LED_CHARGING,
     LED_ALARM,
-    LED_DOUBLE_TAP,
     LED_SIGNAL
 } led_fading_t;
 
@@ -275,6 +274,7 @@ static void plug_reactivation_timeout_handler(struct k_timer* timer);
 static void bond_allowed_timeout_handler(struct k_timer* timer);
 static void auth_timeout_handler(struct k_timer* timer);
 static void gsm_send_timeout_handler(struct k_timer* timer);
+static void button_timeout_handler(struct k_timer* timer);
 
 //static void abort_fmna_user_pairing_timeout_handler(struct k_timer* timer);
 
@@ -436,6 +436,10 @@ static bool                     m_start_factory_reset = false;                  
 const struct device*            m_ram = DEVICE_DT_GET(DT_NODELABEL(retention0));            // Region im RAM der bei Reset erhalten bleibt
 static bool                     m_chain_temp_disabled = false;                              // Gibt an, ob die Kette temporär deaktiviert wurde
 static bool                     m_restart_allowed = false;                                  // Gibt an, ob das Schloss per Ladekabel neu gestartet werden kann
+static bool                     m_opening_was_blocked = false;                              // Gibt an, ob beim Öffnen blockiert wurde
+static uint64_t                 m_last_button_pressed_time = 0;                             // Zeitpunkt der letzten Tap-Erkennung
+static bool                     m_service_code_allowed = false;                             // Flag, das angibt, ob die Eingabe des Service-Farbcodes erlaubt ist
+
 
 //////////////////////////////////////////////////////////////
 //               Alarm / Signalton                          //
@@ -636,6 +640,7 @@ struct k_timer m_plug_reactivation_timer;
 struct k_timer m_bond_allowed_timer;
 struct k_timer m_auth_timer;
 struct k_timer m_gsm_send_timer;
+struct k_timer m_button_timer;
 //struct k_timer m_abort_fmna_user_pairing_timer;
 
 
@@ -657,6 +662,8 @@ static void timers_init()
     k_timer_init(&m_bond_allowed_timer, bond_allowed_timeout_handler, NULL);
     k_timer_init(&m_auth_timer, auth_timeout_handler, NULL);
     k_timer_init(&m_gsm_send_timer, gsm_send_timeout_handler, NULL);
+    k_timer_init(&m_button_timer, button_timeout_handler, NULL);
+    
     
 //    k_timer_init(&m_abort_fmna_user_pairing_timer, abort_fmna_user_pairing_timeout_handler, NULL);
 }
@@ -1246,6 +1253,51 @@ void gsm_send_timeout_handler(struct k_timer* timer)
 }
 
 
+void button_timeout_handler(struct k_timer* timer)
+{
+    if(m_factory_condition)
+        return;
+
+    // Geschlossen oder unbekannter Schließzustand
+    if((m_current_locking_state == STATUS_MOTOR_1_CLOSED || m_current_locking_state == STATUS_MOTOR_1_LOCK_STATE_UNKNOWN) && m_opening_was_blocked == false)
+    {
+        // Alarmauswertung bei Drücken des Tasters stoppen
+        if(m_button_counter == 0)
+            alarmcheck_stop();
+
+        
+        // Motoren nicht aktiv, Farbcode-Eingabe erlaubt, BLE nicht verbunden und Ladekabel steckt ->
+        // Nach 30 Sek. wird die rote LED eingeschaltet um die Eingabe des Service-Farbcodes zu signalisieren
+        if(m_button_counter == 600 && ili_motorcontroller_get_motor_1_state() == MOTOR_STOP && ili_motorcontroller_get_motor_2_state() == MOTOR_STOP && m_colorcode_input_allowed
+            && m_peripheral_conn_count == 0 && m_charge_active)
+        {
+            
+            LOG_DBG("Counter = 600");
+            // Eingabe Service-Farbcode signalisieren
+            led(LED_R);
+        }
+            
+        // Wenn der Taster zu lange gedrückt wird, 
+        // startet die Alarmauswertung wieder
+        if(m_button_counter == 100)
+            alarmcheck_start();
+    }
+    // Schloss ist geöffnet
+    else
+    {
+        // Blaue LED signalisiert Start des Bondingmodus
+        if(m_button_counter == 60 && m_bonding_allowed)
+            led(LED_B);
+            
+        // Eingabe Service-Farbcode signalisieren
+        if(m_button_counter == 600 && m_charge_active)
+            led(LED_R);
+    }
+        
+    m_button_counter++;
+}
+
+
 /*
     Timer zum Abbruch der Find-My Pairing Prozedur
 */
@@ -1375,7 +1427,6 @@ static const led_pattern_t m_led_patterns[] =
     [LED_UNLOCKING]  = { ILI_LED_MODE_PULSE,    40,  800, 15000 },  // MOTOR_TIMEOUT_INTERVAL
     [LED_CHARGING]   = { ILI_LED_MODE_BREATHE,  40, 3000,     0 },  // laeuft bis zum Ende des Ladevorgangs
     [LED_ALARM]      = { ILI_LED_MODE_BLINK,    80,  250, 30000 },  // THIRTY_SEC_TIMEOUT_INTERVAL
-    [LED_DOUBLE_TAP] = { ILI_LED_MODE_STATIC,   50, 1000,   500 },  // DOUBLE_TAP_TIMEOUT_INTERVAL
     [LED_SIGNAL]     = { ILI_LED_MODE_BLINK,    80,  400, 10000 },  // TEN_SEC_TIMEOUT_INTERVAL
 };
 
@@ -4658,12 +4709,54 @@ static void plug_evt_handler(button_evt_t evt)
         case MAIN_BUTTON_EVT_PRESSED:
         {
             LOG_DBG("MAIN_BUTTON_EVT_PRESSED");
+            if(m_bonding_mode_active == false)
+            {
+                LOG_DBG("Taster gedrückt");
+                k_timer_start(&m_button_timer, BUTTONPRESS_TIMEOUT_INTERVAL, BUTTONPRESS_TIMEOUT_INTERVAL);
+                    
+                // Bei Farbcode-Eingabe muss die gewählte Farbe angezeigt werden sobald der Taster gedrückt wurde
+                if((authorised_user_is_nearby() == false  || m_colorcode_in_index > 0) && 
+                    (m_current_locking_state == STATUS_MOTOR_1_CLOSED || m_current_locking_state == STATUS_MOTOR_1_LOCK_STATE_UNKNOWN) &&
+                        m_colorcode_input_allowed && m_factory_condition == false &&
+                            ili_motorcontroller_get_motor_1_state() == MOTOR_STOP && ili_motorcontroller_get_motor_2_state() == MOTOR_STOP && m_opening_was_blocked == false)
+                {
+                    k_timer_stop(&m_colorcode_input_timer);
+                    TD("k_timer_stop(&m_led_timer);");
+                    // Timer für die Kontrolle der kompletten Eingabe stoppen
+                    k_timer_stop(&m_colorcode_timeout_timer);
+                        
+                    switch(m_selected_color)
+                    {
+                        case 0:
+                            led(LED_G);
+                        break;
+                            
+                        case 1:
+                            led(LED_B);
+                        break;
+                            
+                        case 2:
+                            led(LED_R);
+                        break;
+                            
+                        case 3:
+                            led(LED_W);
+                        break;
+                    }
+                }
+            }
         }
         break;
 
         case MAIN_BUTTON_EVT_RELEASED:
         {
             LOG_DBG("MAIN_BUTTON_EVT_RELEASED");
+            if(m_bonding_mode_active == false)
+            {
+                k_timer_stop(&m_button_timer);
+                // Event für Tastendruck erzeugen
+                m_triggered_pins |= IRQ_BUTTON;
+            }
         }
         break;
         
@@ -5572,7 +5665,178 @@ static void uart_evt_handler(const struct device* dev, struct uart_event* evt, v
 */
 void do_button_action()
 {
+    LOG_DBG("do_button_action - counter %d", m_button_counter);
+    
+    //led(LED_OFF);
 
+     // Nicht mehr im Werkszustand
+    if(m_factory_condition == false)
+    {
+        //gsm_send(CMD_STATUS_ALARM);
+        //gps_on();
+
+        //saadc_sampling_event_disable();
+        
+        // Motoren sind aktiv -> Stoppen
+        if(ili_motorcontroller_get_motor_1_state() || ili_motorcontroller_get_motor_2_state())
+        {
+            if(k_uptime_delta(&m_last_button_pressed_time) > DOUBLE_CLICK_TIMEOUT)
+            {
+                led(LED_OFF);
+                
+                ili_motorcontroller_motor_1_stop();
+                
+                m_current_locking_state = STATUS_MOTOR_1_LOCK_STATE_UNKNOWN;
+                
+                send_status(BLE_CONN_HANDLE_ALL, STATUS_MOTOR_1_LOCK_STATE_UNKNOWN);
+                
+                // RSSI-Auswertung starten um mit Taster öffnen zu können
+                rssi_start(BLE_CONN_HANDLE_ALL);
+            }
+        }
+        // Eingabe des Service-Farbcodes erlauben
+        else if(m_button_counter >= 600)
+        {
+            led(LED_OFF);
+            
+            if(m_peripheral_conn_count == 0 && m_charge_active)
+            {
+                LOG_DBG("Eingabe Service-Farbcode erlaubt");
+                m_service_code_allowed = true;
+                k_timer_start(&m_service_code_reset_timer, BOND_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
+                
+                // Abfrage ob geöffnet vorher, damit das rote Blinken verhindert wird
+                if(m_current_locking_state != STATUS_MOTOR_1_CLOSED)
+                {
+                    k_msleep(1000);
+                    motor_1_start(false);
+                }
+            }
+        }
+        // Geschlossen oder unbekannter Schließzustand
+        else if((m_current_locking_state == STATUS_MOTOR_1_CLOSED || m_current_locking_state == STATUS_MOTOR_1_LOCK_STATE_UNKNOWN) && m_opening_was_blocked == false)
+        {
+            // Nutzer nicht verbunden -> Eingabe Farbcode
+            if(authorised_user_is_nearby() == false || m_colorcode_in_index > 0)
+            {
+                // Bei gesperrter Eingabe rot blinken
+                if(m_colorcode_input_allowed)
+                {
+                    m_colorcode_in[m_colorcode_in_index] = m_selected_color;    
+                    m_selected_color = (++m_selected_color) % 4;
+                    
+                    LOG_DBG("m_colorcode_in[%d] = %d", m_colorcode_in_index, m_colorcode_in[m_colorcode_in_index]);
+                    // Timer zur Überwachung der Eingabe starten
+                    k_timer_start(&m_colorcode_input_timer, ONE_SEC_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
+                }
+                else    // Farbcode-Eingabe gesperrt
+                {
+                    LOG_DBG("Farbcode-Eingabe gesperrt");
+                    // rote LED blinken lassen    
+                    led_timed(LED_R, LED_ERROR);
+                }
+                
+                // Alarmauswertung beim Loslassen des Tasters fortsetzen
+                if(m_current_locking_state == STATUS_MOTOR_1_CLOSED)
+                    alarmcheck_start();
+            }
+            // Autorisierter Nutzer in der Nähe
+            else
+            {
+                ili_motorcontroller_motor_1_start(true);
+
+                // Wenn das Schloss nicht geöffnet wird, blinkt die rote LED
+                if(ili_motorcontroller_get_motor_1_state() == MOTOR_STOP)
+                {
+                    // rote LED blinken lassen 
+                    led_timed(LED_R, LED_ERROR);
+                }
+                else
+                {
+                    // Tastendruck zum Anhalten kurz deaktivieren
+                    // Es wird die aktuelle Zeit ermittelt und dann bei einem neuen Tastendruck 
+                    // weiter oben verglichen. Das spart Flag und Timer
+                    m_last_button_pressed_time = k_uptime_get();
+                }
+            }
+        }
+        // Schloss ist geöffnet
+        else
+        {
+            // Ersten Klick erfassen
+            if((m_bonding_allowed == false && k_uptime_delta(&m_last_button_pressed_time) > DOUBLE_CLICK_TIMEOUT ) || (m_bonding_allowed && m_button_counter < 60 && k_uptime_delta(&m_last_button_pressed_time) > DOUBLE_CLICK_TIMEOUT))
+            {
+                m_last_button_pressed_time = k_uptime_get();
+            }
+            // Abschließen
+            else if((m_bonding_allowed == false && k_uptime_delta(&m_last_button_pressed_time) <= DOUBLE_CLICK_TIMEOUT) || (m_bonding_allowed && m_button_counter < 60 && k_uptime_delta(&m_last_button_pressed_time) <= DOUBLE_CLICK_TIMEOUT))
+            {
+                led_timed(LED_R, LED_STATIC);
+                
+                ili_motorcontroller_motor_1_start(false);
+                m_last_button_pressed_time = 0;
+                
+                // Wenn das Schloss geschlossen wird, Taster kurz deaktivieren
+                if(ili_motorcontroller_get_motor_1_state() != MOTOR_STOP)
+                {
+                    // Tastendruck zum Anhalten kurz deaktivieren
+                    // Es wird die aktuelle Zeit ermittelt und dann bei einem neuen Tastendruck 
+                    // weiter oben verglichen. Das spart Flag und Timer
+                    m_last_button_pressed_time = k_uptime_get();
+                }
+            }
+            // Bondingmodus starten
+            else if((m_bonding_allowed && m_button_counter >= 60))
+                new_bond();
+        }
+    }
+    else if(m_needed_tests != TEST_NOT_FOUND && m_needed_tests != TEST_NONE)
+    {
+        LOG_DBG("Testmode Button");
+        
+        if(m_button_counter >= 60)
+        {
+            m_test_active = false;
+            
+            if(m_actual_test == 10)
+            {
+                m_testmode_state |= TEST_GSM;
+                m_actual_test = TEST_GSM;
+            }
+            else if(m_actual_test == 11)
+            {
+                m_testmode_state |= TEST_LEDS;
+                m_actual_test = TEST_LEDS;
+            }
+            else
+            {
+                if(ili_motorcontroller_get_motor_1_state() != MOTOR_STOP)
+                {
+                    ili_motorcontroller_motor_1_stop();
+                    m_current_locking_state = STATUS_MOTOR_1_LOCK_STATE_UNKNOWN;
+                }
+                
+                if(ili_motorcontroller_get_motor_2_state() != MOTOR_STOP)
+                {
+                    ili_motorcontroller_motor_2_stop();
+                    m_current_locking_state_chain = STATUS_MOTOR_2_LOCK_STATE_UNKNOWN;
+                }
+                
+                ili_motorcontroller_motor_1_start(true);
+                ili_motorcontroller_motor_2_start(true);
+                
+                m_testmode_state |= TEST_MECHANIC;
+                m_actual_test = TEST_MECHANIC;
+            }
+        }
+    }
+    else
+    {
+        new_bond();
+    }
+    
+    // Zähler für Länge des Tastendrucks zurücksetzen
+    m_button_counter = 0;
 }
 
 
@@ -6330,7 +6594,6 @@ int main(void)
     //ili_piezo_play(ILI_PIEZO_SOUND_ALARM);
 
      //advertising_start();
-
 
 TD("TODOs:");
 // https://docs.nordicsemi.com/bundle/ncs-1.7.1/page/zephyr/guides/debug_tools/thread-analyzer.html

@@ -143,6 +143,9 @@
 ///////// LED-PWM ///////
 #define LED_PWM_SEQ_VALUE                   80
 
+///////// Doppelklick-Zeit ///////
+#define DOUBLE_CLICK_TIMEOUT                1000
+
 ///////// Flash ///////
 #define SETTINGS_ID         0x1111
 #define SETTINGS_KEY        0x2222
@@ -236,6 +239,7 @@
 #define TEST_NONE                           0x00
 #define TEST_MECHANIC                       0x0100
 #define TEST_GSM                            0x0200
+#define TEST_LEDS                           0x0400
 #define TEST_NOT_FOUND                      0x8000
 
 ///////// RAM-Offsets für Variablen ///////
