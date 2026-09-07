@@ -297,10 +297,9 @@ static void relock_close_timeout_handler(struct k_timer* timer);
 #define ADV_TEST_LEGACY     1
 
 #if ADV_TEST_LEGACY
-// Advertising-Daten: Flags + vollstaendiger Geraetename
-static const struct bt_data m_adv_data[] = {
-    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR))
-};
+// Advertising-Daten (Flags + Geraetename) werden dynamisch in start_adv_handler()
+// aus m_uicr_data.advertising_name aufgebaut, da der Name erst zur Laufzeit aus dem
+// UICR gelesen wird.
 #else
 static struct bt_le_ext_adv *m_ili_pro_adv_set;
 #endif
@@ -741,7 +740,12 @@ void start_adv_handler(struct k_work* work)
         
         int err;
 #if ADV_TEST_LEGACY
-        err = bt_le_adv_start(BLE_ADV_CONN_SLOW, m_adv_data, ARRAY_SIZE(m_adv_data), NULL, 0);
+        const struct bt_data adv_data[] = {
+            BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+            BT_DATA(BT_DATA_NAME_COMPLETE, m_uicr_data.advertising_name, ADV_NAME_LENGTH)
+        };
+
+        err = bt_le_adv_start(BLE_ADV_CONN_SLOW, adv_data, ARRAY_SIZE(adv_data), NULL, 0);
         LOG_DBG("bt_le_adv_start = %d", err);
 #else
         struct bt_le_ext_adv_start_param ext_adv_start_param = {0};
