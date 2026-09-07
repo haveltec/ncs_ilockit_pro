@@ -1,0 +1,1 @@
+mergehex --merge .\build\mcuboot\zephyr\zephyr.hex .\build\ncs_ilockit_pro\zephyr\zephyr.signed.hex --output merged.hex
