@@ -115,8 +115,8 @@
 #define IRQ_CHARGE_COMPLETED                0x0040
 #define IRQ_MOTOR_2_CLOSED                  0x0080
 #define IRQ_MOTOR_2_OPENED                  0x0100
-#define IRQ_USB_DETECTED                    0x0200
-#define IRQ_USB_REMOVED                     0x0400
+#define IRQ_CHARGE_STARTED                  0x0200
+
 
 #define MAIN_BUTTON_PULL                    NRF_GPIO_PIN_PULLDOWN
 

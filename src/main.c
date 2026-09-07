@@ -253,6 +253,9 @@ static void gsm_send(uint8_t command);                              // Funktion 
 static void uart_gsm_send_ack(uint8_t command);                     // Funktion zum Senden eines Acknowledges
 static void gps_on();
 static void gps_off();
+static void relock_check_start(void);                           // Bewegungsprüfung zum autom. Schließen starten
+static void relock_check_stop(void);                            // Bewegungsprüfung zum autom. Schließen stoppen
+
 //static void start_fmna_pairing_handler(struct k_work* work);
 
 //////////////////////////////////////////////////////////////
@@ -275,6 +278,7 @@ static void bond_allowed_timeout_handler(struct k_timer* timer);
 static void auth_timeout_handler(struct k_timer* timer);
 static void gsm_send_timeout_handler(struct k_timer* timer);
 static void button_timeout_handler(struct k_timer* timer);
+static void relock_close_timeout_handler(struct k_timer* timer);
 
 //static void abort_fmna_user_pairing_timeout_handler(struct k_timer* timer);
 
@@ -443,7 +447,6 @@ static bool                     m_service_code_allowed = false;                 
 //               Alarm / Signalton                          //
 //////////////////////////////////////////////////////////////
 uint8_t     m_alarmcounter = 0;                 // Zähler für Bewegungssamples zum Ermitteln eines Alarms
-uint8_t     m_collected_debounce_samples = 0;   // Zähler für Samples, die während des Debounce gesammelt wurden
 bool        m_alarmsound_active = false;        // Gibt an, ob der Alarm aktiv ist
 bool        m_prealarm_active = false;          // Gibt an, ob der Voralarm aktiv ist
 bool        m_prealarm_fired = false;           // Gibt an, ob ein Warnton bereits abgespielt wurde
@@ -639,6 +642,7 @@ struct k_timer m_bond_allowed_timer;
 struct k_timer m_auth_timer;
 struct k_timer m_gsm_send_timer;
 struct k_timer m_button_timer;
+struct k_timer m_relock_close_timer;
 //struct k_timer m_abort_fmna_user_pairing_timer;
 
 
@@ -661,7 +665,7 @@ static void timers_init()
     k_timer_init(&m_auth_timer, auth_timeout_handler, NULL);
     k_timer_init(&m_gsm_send_timer, gsm_send_timeout_handler, NULL);
     k_timer_init(&m_button_timer, button_timeout_handler, NULL);
-    
+    k_timer_init(&m_relock_close_timer, relock_close_timeout_handler, NULL);
     
 //    k_timer_init(&m_abort_fmna_user_pairing_timer, abort_fmna_user_pairing_timeout_handler, NULL);
 }
@@ -1296,6 +1300,20 @@ void button_timeout_handler(struct k_timer* timer)
 }
 
 
+void relock_close_timeout_handler(struct k_timer* timer)
+{
+    LOG_DBG("relock_close_timeout_handler");
+    
+    // Wenn noch immer die Bewegungsprüfung aktiv ist und es sind keine Geräte mehr verbunden -> Schließen
+    if(m_relock_state == RELOCK_MOVEMENT_CHECK && authorised_user_connected() == false && m_bonded_fob_connected == false)
+    {
+        m_relock_state = RELOCK_CLOSED;
+        // Hier wird nicht direkt geschlossen um ein Blockieren anderer Timer
+        // durch die 2 Sek. lange Auswertung der Bewegung zu verhindern
+        // Geschlossen wird in der Hauptschleife
+    }
+}
+
 /*
     Timer zum Abbruch der Find-My Pairing Prozedur
 */
@@ -1340,6 +1358,51 @@ static bool authorised_user_connected()
     }
 
     return false;
+}
+
+
+/** @brief Starten der Prüfung ob wieder geschlossen werden soll nach autom. Öffnen
+*/
+void relock_check_start()
+{
+    LOG_DBG("m_relock_state = %d", m_relock_state);
+    
+    if(m_relock_state == RELOCK_AUTO_OPENED)
+    {
+        LOG_DBG("auto_close_check_start");
+        
+        m_relock_state = RELOCK_MOVEMENT_CHECK;
+        m_alarmcounter = 0;
+        
+        // Beschleunigungssensor aktivieren
+        k_work_submit(&work_acc_sniff);
+        
+        // Pin-Interupt aktivieren
+        gpio_add_callback(pin_accel_int1.port, &accel_int1_cb_data);
+        
+        // Falls bereits zum Start der Bewegungsprüfung kein Gerät mehr verbunden ist, wird der Timer sofort gestartet
+        if(authorised_user_connected() == false && m_bonded_fob_connected == false)
+        {
+            k_timer_start(&m_relock_close_timer, FIVE_SEC_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
+        }
+    }
+}
+
+
+/** @brief Stoppen der Prüfung ob wieder geschlossen werden soll nach autom. Öffnen
+*/
+void relock_check_stop()
+{
+    LOG_DBG("auto_close_check_stop");
+    m_alarmcounter = 0;
+    
+    k_work_submit(&work_acc_sleep);
+    gpio_remove_callback(pin_accel_int1.port, &accel_int1_cb_data);
+    
+    m_relock_state = RELOCK_INACTIVE;
+    
+    // Timer wird nach dem ersten Interrupt gestartet
+    k_timer_stop(&m_check_alarm_timer);
 }
 
 
@@ -4502,12 +4565,14 @@ static void in_pin_handler(const struct device *dev, struct gpio_callback *cb, u
 			break;
 		}
 	}
-   // LOG_DBG("in_pin_handler - bit_to_pin %d", bit_to_pin);
+    LOG_DBG("in_pin_handler - bit_to_pin %d", bit_to_pin);
 
     if(bit_to_pin == pin_charge.pin)
     {
         if(gpio_pin_get_dt(&pin_charge))
             m_triggered_pins |= IRQ_CHARGE_COMPLETED;
+        else
+            m_triggered_pins |= IRQ_CHARGE_STARTED;
     }
     else if(bit_to_pin == pin_accel_int1.pin)
     {
@@ -4566,15 +4631,8 @@ static void motorcontroller_evt_handler(mc_evt_t evt)
 
         case MC_MOTOR_2_TIMEOUT:
         {
-            LOG_DBG("MC_MOTOR_2_TIMEOUT");
-
-            m_current_locking_state_chain = STATUS_MOTOR_2_LOCK_STATE_UNKNOWN;
-            k_work_submit(&work_retention_write);
-
-            // Rote LED blinken lassen
-            led_timed(LED_R, LED_ERROR);
-
-            beep_start(ILI_PIEZO_SOUND_WARNING);
+            LOG_DBG("MC_MOTOR_2_TIMEOUT - motor_2_opened: %d, motor_2_closed: %d",
+                    evt.motor_2_opened, evt.motor_2_closed);
 
             if(evt.last_state == MOTOR_OPEN)
             {
@@ -4587,13 +4645,27 @@ static void motorcontroller_evt_handler(mc_evt_t evt)
                 m_fob_status = ILI_C_CLOSE_BLOCKED;
             }
 
-            alarmcheck_start();
+            // Schließzustand setzen
+            // Bei einem Timeout werden die Pins ausgelesen und in dem Event übergeben
+            if(evt.motor_2_opened && evt.motor_2_closed == false)
+                m_current_locking_state_chain = STATUS_MOTOR_2_OPENED;
+            else if(evt.motor_2_opened == false && evt.motor_2_closed)
+                m_current_locking_state_chain = STATUS_MOTOR_2_CLOSED;
+            else
+                m_current_locking_state_chain = STATUS_MOTOR_2_LOCK_STATE_UNKNOWN;
+            
+            k_work_submit(&work_retention_write);
 
-            // Unbekannten Schließzustand senden, wenn Motor steht
+            // Rote LED blinken lassen
+            led_timed(LED_R, LED_ERROR);
+            beep_start(ILI_PIEZO_SOUND_WARNING);
+
+            // Unbekannten Schließzustand senden
             k_work_submit(&work_fob_send_status);
             k_msleep(100);
             send_status(BLE_CONN_HANDLE_ALL, m_current_locking_state_chain);
-            send_status(BLE_CONN_HANDLE_ALL, m_current_locking_state);
+
+            alarmcheck_start();
         }
         break;
 
@@ -4601,7 +4673,7 @@ static void motorcontroller_evt_handler(mc_evt_t evt)
         {
             LOG_DBG("MC_MOTOR_1_TIMEOUT");
     
-            m_current_locking_state_chain = STATUS_MOTOR_2_LOCK_STATE_UNKNOWN;
+            m_current_locking_state = STATUS_MOTOR_1_LOCK_STATE_UNKNOWN;
             k_work_submit(&work_retention_write);
 
             // Rote LED blinken lassen
@@ -4611,21 +4683,32 @@ static void motorcontroller_evt_handler(mc_evt_t evt)
 
             if(evt.last_state == MOTOR_OPEN)
             {
-                send_status(BLE_CONN_HANDLE_ALL, STATUS_MOTOR_2_OPEN_BLOCKED);
+                send_status(BLE_CONN_HANDLE_ALL, STATUS_MOTOR_1_OPEN_BLOCKED);
                 m_fob_status = ILI_C_OPEN_BLOCKED;
+
+                // Aktion nach automatischem Öffnen ausführen -> Prüfung für autom. Schließen
+                relock_check_start();
+                m_opening_was_blocked = true;
             }
             else if(evt.last_state == MOTOR_CLOSE)
             {
-                send_status(BLE_CONN_HANDLE_ALL, STATUS_MOTOR_2_CLOSE_BLOCKED);
+                send_status(BLE_CONN_HANDLE_ALL, STATUS_MOTOR_1_CLOSE_BLOCKED);
                 m_fob_status = ILI_C_CLOSE_BLOCKED;
+
+                // Bei Blockade wird der Bügel wieder geöffnet, wenn ein Nutzer in der Nähe
+                // Andernfalls wird die Alarmauswertung aktiviert
+                if(authorised_user_is_nearby())
+                    motor_1_start(true);
+                else
+                    alarmcheck_start();
             }
 
-            alarmcheck_start();
+            // RSSI-Auswertung wieder starten
+            rssi_start();
 
             // Unbekannten Schließzustand senden, wenn Motor steht
             k_work_submit(&work_fob_send_status);
             k_msleep(100);
-            send_status(BLE_CONN_HANDLE_ALL, m_current_locking_state_chain);
             send_status(BLE_CONN_HANDLE_ALL, m_current_locking_state);
         }
         break;
@@ -5832,9 +5915,16 @@ void do_button_action()
 
 static void evaluate_gpio_pins()
 {
-    if(is_pin_triggered(IRQ_USB_DETECTED))
+    if(is_pin_triggered(IRQ_CHARGE_STARTED))
     {
-        LOG_DBG("IRQ_USB_DETECTED");
+        LOG_DBG("IRQ_CHARGE_STARTED");
+        
+        m_charge_active = false;
+
+        if(!m_bonding_mode_active && (m_needed_tests & TEST_GSM) == 0)
+            led_faded(LED_R, LED_CHARGING);
+
+
     }
     else if(is_pin_triggered(IRQ_CHARGE_COMPLETED))
     {
@@ -5858,10 +5948,6 @@ static void evaluate_gpio_pins()
         if(!m_bonding_mode_active)
             led_off();
     }
-    else if(is_pin_triggered(IRQ_USB_REMOVED))
-    {
-        LOG_DBG("IRQ_USB_REMOVED");
-    }
     else if(is_pin_triggered(IRQ_BUTTON))
     {
         LOG_DBG("PIN_BUTTON with %d ticks", m_button_counter);
@@ -5878,20 +5964,16 @@ static void evaluate_gpio_pins()
         {
             send_status(BLE_CONN_HANDLE_ALL, STATUS_CHAIN_CONNECTED);
 
-            if(m_factory_condition == false && m_current_locking_state_chain != STATUS_MOTOR_2_CLOSED && m_chain_temp_disabled == false)
+            if(m_factory_condition == false && m_current_locking_state_chain != STATUS_MOTOR_2_CLOSED 
+                && m_chain_temp_disabled == false && ili_motorcontroller_get_motor_1_state() == MOTOR_STOP)
             {
-                if(m_current_locking_state == STATUS_MOTOR_1_CLOSED)
-                {
-                    alarmcheck_stop();
-                    m_current_locking_state = STATUS_MOTOR_1_OPENED;
-                }
-
-                if(ili_motorcontroller_get_motor_1_state() == MOTOR_STOP)
-                {
-                    // Kurze Pause vor Bewegungsprüfung
-                    k_msleep(1000);
-                    motor_1_start(false);
-                }
+                // Kurze Pause vor Bewegungsprüfung
+                k_msleep(1000);
+                motor_1_start(false);
+            }
+            else if(m_factory_condition && m_actual_test == 6)
+            {
+                motor_2_start(false, false);
             }
         }
         else
@@ -5907,35 +5989,66 @@ static void evaluate_gpio_pins()
     else if(is_pin_triggered(IRQ_MOTOR_1_OPENED))
     {
         LOG_DBG("IRQ_MOTOR_1_OPENED");
+        // Schließzustand setzen und an App übertragen
+        m_current_locking_state = STATUS_MOTOR_1_OPENED;
+        send_status(BLE_CONN_HANDLE_ALL, STATUS_MOTOR_1_OPENED);
+
+        // Schließzustand im RAM ablegen
+        k_work_submit(&work_retention_write);
+
+        if(ili_motorcontroller_get_motor_2_state() == MOTOR_STOP)
+            led_timed(ILI_LED_G, ILI_LED_MODE_STATIC);
+        
+        // Aktion nach automatischem Öffnen ausführen -> Prüfung für autom. Schließen
+        relock_check_start();
+
+        // Wenn Bonding durch Farbcode-Eingabe erlaubt wird hier der Timer gestartet
+        if(m_bonding_allowed)
+            k_timer_start(&m_bond_allowed_timer, TEN_SEC_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
+        
+        // Wenn der Service-Farbcode zum Öffnen genutzt wurde, wird der Werkszustand hergestellt
+        if(m_service_code_allowed)
+            m_start_factory_reset = true;
     }
     else if(is_pin_triggered(IRQ_MOTOR_1_CLOSED))
     {
         LOG_DBG("IRQ_MOTOR_1_CLOSED");
+
+        // Schließzustand setzen und an App übertragen
+        m_current_locking_state = STATUS_MOTOR_1_CLOSED;
+        send_status(BLE_CONN_HANDLE_ALL, STATUS_MOTOR_1_CLOSED);
+        
+        if(ili_motorcontroller_get_motor_2_state() == MOTOR_STOP)
+        {
+            led_timed(ILI_LED_R, ILI_LED_MODE_STATIC);
+        }
+        
+        alarmcheck_start();
+        
+        // Schließzustand im RAM ablegen
+        k_work_submit(&work_retention_write);
+
+        // RSSI-Messung aktivieren
+        rssi_start();
     }
     else if(is_pin_triggered(IRQ_MOTOR_2_OPENED))
     {
         LOG_DBG("IRQ_MOTOR_OPENED");
 
-        led_timed(LED_G, LED_STATIC);
-
-        beep_start(ILI_PIEZO_SOUND_DISARMED);
-
         m_current_locking_state_chain = STATUS_MOTOR_2_OPENED;
         send_status(BLE_CONN_HANDLE_ALL, m_current_locking_state_chain);
-        send_status(BLE_CONN_HANDLE_ALL, m_current_locking_state);
+        
+        // Wenn der andere Motor still steht wird die grüne LED aktiviert
+        if(ili_motorcontroller_get_motor_1_state() == MOTOR_STOP)
+        {
+            led_timed(ILI_LED_G, ILI_LED_MODE_STATIC);
+        }
+
+        // Alarmauswertung starten, falls Bügel noch geschlossen
+        alarmcheck_start();
 
         // Schließzustand im RAM ablegen
         k_work_submit(&work_retention_write);
-
-        if(m_service_code_state == SERVICE_CODE_CORRECT)
-            m_start_factory_reset = true;
-
-        // Wenn nur die Kette geöffnet und nicht der Alarm beendet wurde
-        if(m_current_locking_state == STATUS_MOTOR_1_CLOSED)
-        {
-            // Einige Sekunden warten, bis der Alarm wieder aktiviert wird
-            k_timer_start(&m_alarm_restart_timer, FIVE_SEC_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
-        }
 
         LOG_DBG("Battery level: %d", ili_battery_get_value());
     }    
@@ -5943,18 +6056,19 @@ static void evaluate_gpio_pins()
     {
         LOG_DBG("IRQ_MOTOR_CLOSED");
 
-        led_timed(LED_R, LED_STATIC);
-        beep_start(ILI_PIEZO_SOUND_ARMED);
-
         // Schließzustand setzen und an App übertragen
         m_current_locking_state_chain = STATUS_MOTOR_2_CLOSED;
         send_status(BLE_CONN_HANDLE_ALL, m_current_locking_state_chain);
-        send_status(BLE_CONN_HANDLE_ALL, m_current_locking_state);
-
+        
         // Schließzustand im RAM ablegen
         k_work_submit(&work_retention_write);
 
-        m_current_locking_state = STATUS_MOTOR_1_CLOSED;
+        // Wenn der andere Motor still steht wird die rote LED aktiviert
+        if(ili_motorcontroller_get_motor_1_state() == MOTOR_STOP)
+        {
+            led_timed(ILI_LED_R, ILI_LED_MODE_STATIC);
+        }
+
         alarmcheck_start();
     }
     else if(is_pin_triggered(IRQ_ACC_ALARM))
@@ -5962,7 +6076,7 @@ static void evaluate_gpio_pins()
         LOG_DBG("IRQ_ACC_ALARM");
 
         if(m_settings.alarm.armed && ili_motorcontroller_get_motor_1_state() == MOTOR_STOP
-            && m_signalsound_active == false)
+            && ili_motorcontroller_get_motor_2_state() == MOTOR_STOP && m_signalsound_active == false)
         {
             if(m_alarmcounter == 0)
             {
@@ -5981,11 +6095,6 @@ static void evaluate_gpio_pins()
             }
 
             m_alarmcounter++;
-
-            // Anzahl der Alarmsamples hinzufügen, die während der Debounce-Zeit gesammelt wurden
-            m_alarmcounter += m_collected_debounce_samples;
-            m_collected_debounce_samples = 0;
-
             LOG_DBG("m_alarmcounter = %d", m_alarmcounter);
 
             // In Hauptschleife schieben
@@ -5998,6 +6107,15 @@ static void evaluate_gpio_pins()
                 else
                 {
                     alarmsound_start();
+
+                    // Wenn niemand verbunden und autorisiert ist wird das GPS aktiviert
+                    if(authorised_user_connected() == false)
+                    {
+                        gsm_send(CMD_STATUS_ALARM);
+                        // Wenn erw. Diebstahlmodus aktiv, wird der Status abgefragt
+                        if((m_settings.theft_mode & THEFT_MODE_ACTIVE) != 0)
+                            gsm_send(CMD_THEFT_REQ);
+                    }
                 }
             }
             else
@@ -6008,12 +6126,30 @@ static void evaluate_gpio_pins()
     }
     else if(is_pin_triggered(IRQ_ACC_RELOCK))
     {
-        
-        
         if(m_relock_state == RELOCK_INACTIVE)
             return;
         
         LOG_DBG("IRQ_ACC_RELOCK");
+
+        if(m_alarmcounter == 0)
+        {
+            // Timer für das Zurücksetzen des Bewegunssählers starten
+            k_timer_start(&m_check_alarm_timer, CHECK_ALARM_TIMEOUT, SINGLE_SHOT_TIMEOUT);
+        }
+        
+        m_alarmcounter++;
+        LOG_DBG("counter = %d", m_alarmcounter);
+        
+        // Schwellwert für Bewegung erreicht -> Muss nicht automatisch geschlossen werden
+        if(m_alarmcounter > RELOCK_THRESHOLD)
+        {
+            relock_check_stop();
+        }
+        else
+        {
+            // Beschleunigungssensor wieder in SNIFF-Modus setzen
+            accelerometer_sniff();
+        }
     }
     else
     {
@@ -6524,8 +6660,9 @@ int main(void)
 
     //get_locking_state();
 
+    // Ladevorgang beim Start detektieren
     if(gpio_pin_get_dt(&pin_charge) == 0)
-        m_charge_active = true;
+        m_triggered_pins |= IRQ_CHARGE_STARTED;
 
     // Peer-Datensätze laden
 	load_peer_data();
