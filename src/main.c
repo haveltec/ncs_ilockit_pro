@@ -479,7 +479,7 @@ uint16_t    m_button_counter = 0;               // Anzahl der Ticks beim Tastend
 //////////////////////////////////////////////////////////////
 //                        Flash                             //
 //////////////////////////////////////////////////////////////
-#define ZMS_PARTITION		        storage_partition
+#define ZMS_PARTITION		        app_storage_partition
 #define ZMS_PARTITION_DEVICE	    FIXED_PARTITION_DEVICE(ZMS_PARTITION)
 #define ZMS_PARTITION_OFFSET	    FIXED_PARTITION_OFFSET(ZMS_PARTITION)
 static struct zms_fs                m_filesys;
