@@ -94,16 +94,15 @@
 #define STATUS_EMPTY                        0xFF
 
 ////////// Befehlsargumente ////////////
-#define LOCK_ACTION_DISABLE_ALARM           0x01
-#define LOCK_ACTION_ENABLE_ALARM            0x02
+#define LOCK_ACTION_OPEN                    0x01
+#define LOCK_ACTION_CLOSE                   0x02
 #define LOCK_ACTION_OPEN_CHAIN              0x03
 #define LOCK_ACTION_CLOSE_CHAIN             0x04
-#define LOCK_ACTION_CHECK_MOVEMENT          0x06
-#define LOCK_ACTION_APP_MOVEMENT_NO         0x09
-#define LOCK_ACTION_APP_MOVEMENT_YES        0x0A
 #define DEVICE_SETTINGS_FACTORY_RESET       0x02
 #define DEVICE_SETTINGS_NEW_BOND            0x05
 #define DEVICE_SETTINGS_QUIT_ALARM          0x0A
+#define DEVICE_SETTINGS_THEFT_REQ_ON        0x0B
+#define DEVICE_SETTINGS_THEFT_REQ_OFF       0x0C
 #define DEVICE_SETTINGS_TEST_GPS            0x11
 
 ////////// App/Bootloader Flag ////////////
