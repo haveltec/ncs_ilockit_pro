@@ -1483,11 +1483,11 @@ static const led_pattern_t m_led_patterns[] =
     [LED_ERROR]      = { ILI_LED_MODE_BLINK,    60,  200,  1000 },  // ONE_SEC_TIMEOUT_INTERVAL
     [LED_DISCONNECT] = { ILI_LED_MODE_BLINK,    60,  200,  1000 },  // ONE_SEC_TIMEOUT_INTERVAL
     [LED_BONDING]    = { ILI_LED_MODE_BREATHE,  40, 1500, 90000 },  // BOND_TIMEOUT_INTERVAL
-    [LED_LOCKING]    = { ILI_LED_MODE_PULSE,    40,  800, 15000 },  // MOTOR_TIMEOUT_INTERVAL
-    [LED_UNLOCKING]  = { ILI_LED_MODE_PULSE,    40,  800, 15000 },  // MOTOR_TIMEOUT_INTERVAL
+    [LED_LOCKING]    = { ILI_LED_MODE_BREATHE,  40, 1000, 15000 },  // MOTOR_TIMEOUT_INTERVAL
+    [LED_UNLOCKING]  = { ILI_LED_MODE_BREATHE,  40, 1000, 15000 },  // MOTOR_TIMEOUT_INTERVAL
     [LED_CHARGING]   = { ILI_LED_MODE_BREATHE,  40, 3000,     0 },  // laeuft bis zum Ende des Ladevorgangs
-    [LED_ALARM]      = { ILI_LED_MODE_BLINK,    80,  250, 30000 },  // THIRTY_SEC_TIMEOUT_INTERVAL
-    [LED_SIGNAL]     = { ILI_LED_MODE_BLINK,    80,  400, 10000 },  // TEN_SEC_TIMEOUT_INTERVAL
+    [LED_ALARM]      = { ILI_LED_MODE_PULSE,    80,  800, 30000 },  // THIRTY_SEC_TIMEOUT_INTERVAL
+    [LED_SIGNAL]     = { ILI_LED_MODE_BLINK,    80,  500, 10000 },  // TEN_SEC_TIMEOUT_INTERVAL
 };
 
 
@@ -1675,11 +1675,11 @@ void beep_start(ili_piezo_mode_t beep_type)
     // Töne nur abspielen, wenn DND Modus nicht aktiv
     if(m_dnd_mode_active == false || beep_type == ILI_PIEZO_SOUND_FMNA_OWNER || beep_type == ILI_PIEZO_SOUND_FMNA_NON_OWNER)
     {
-        if(beep_type == ILI_PIEZO_SOUND_DISARMED && (m_settings.sound.mode & SOUND_CONF_OPEN))
+        if(beep_type == ILI_PIEZO_SOUND_OPENED && (m_settings.sound.mode & SOUND_CONF_OPEN))
         {
             ili_piezo_play(beep_type);
         }
-        else if((beep_type == ILI_PIEZO_SOUND_ARMED && (m_settings.sound.mode & SOUND_CONF_CLOSE))
+        else if((beep_type == ILI_PIEZO_SOUND_CLOSE && (m_settings.sound.mode & SOUND_CONF_CLOSE))
                 || beep_type == ILI_PIEZO_SOUND_AUTO_CLOSE)
         {
             ili_piezo_play(beep_type);
@@ -4451,10 +4451,10 @@ static void motor_1_start(bool direction_open)
             
             // Beim autom. Schließen muss immer ein Ton abgespielt werden,
             // daher wird hier danach unterschieden
-            TD("if(auto_close)\
-                beep_start(SOUND_AUTO_CLOSE);\
+            if(auto_close)
+                beep_start(ILI_PIEZO_SOUND_AUTO_CLOSE);
             else\
-                beep_start(SOUND_CLOSE);");
+                beep_start(ILI_PIEZO_SOUND_CLOSE);
         }
         // Wenn Bewegung erkannt wurde ist der Selbsttest nicht gültig
         // Es kann aber davon ausgegangen werden, dass der Sesor korrekt arbeitet
@@ -4508,7 +4508,7 @@ static void motor_1_start(bool direction_open)
         // Rot blinken im Fehlerfall   
         led_timed(LED_R, LED_ERROR);
         
-        TD("beep_start(SOUND_WARNING);");
+        beep_start(ILI_PIEZO_SOUND_WARNING);
         
         send_status(BLE_CONN_HANDLE_ALL, m_current_locking_state);
         
@@ -4942,21 +4942,21 @@ static void get_locking_state(void)
 	{
 		LOG_DBG("get_locking_state() - geschlossen");
 		// Rote LED anschalten
-		led_timed(ILI_LED_R, ILI_LED_MODE_STATIC);
+		led_timed(ILI_LED_R, LED_STATIC);
 	}
 	// Endlage Geöffnet erreicht
 	else if(m_current_locking_state == STATUS_MOTOR_1_OPENED)
 	{
         LOG_DBG("get_locking_state() - geöffnet");
         // Grüne LED anschalten
-		led_timed(ILI_LED_G, ILI_LED_MODE_STATIC);
+		led_timed(ILI_LED_G, LED_STATIC);
 	}
 	// Keine Endlage erreicht -> Fehlermeldung
 	else
 	{
 		LOG_DBG("get_locking_state() - undefiniert");
         // rote LED blinken lassen 
-        led_timed(ILI_LED_R, ILI_LED_MODE_BLINK);
+        led_timed(ILI_LED_R, LED_ERROR);
         
         // Alarmauswertung starten
         alarmcheck_start();
@@ -6002,7 +6002,9 @@ static void evaluate_gpio_pins()
         k_work_submit(&work_retention_write);
 
         if(ili_motorcontroller_get_motor_2_state() == MOTOR_STOP)
-            led_timed(ILI_LED_G, ILI_LED_MODE_STATIC);
+            led_timed(ILI_LED_G, LED_STATIC);
+        
+        beep_start(ILI_PIEZO_SOUND_OPENED);
         
         // Aktion nach automatischem Öffnen ausführen -> Prüfung für autom. Schließen
         relock_check_start();
@@ -6025,7 +6027,7 @@ static void evaluate_gpio_pins()
         
         if(ili_motorcontroller_get_motor_2_state() == MOTOR_STOP)
         {
-            led_timed(ILI_LED_R, ILI_LED_MODE_STATIC);
+            led_timed(ILI_LED_R, LED_STATIC);
         }
         
         alarmcheck_start();
@@ -6046,7 +6048,7 @@ static void evaluate_gpio_pins()
         // Wenn der andere Motor still steht wird die grüne LED aktiviert
         if(ili_motorcontroller_get_motor_1_state() == MOTOR_STOP)
         {
-            led_timed(ILI_LED_G, ILI_LED_MODE_STATIC);
+            led_timed(ILI_LED_G, LED_STATIC);
         }
 
         // Alarmauswertung starten, falls Bügel noch geschlossen
@@ -6071,7 +6073,7 @@ static void evaluate_gpio_pins()
         // Wenn der andere Motor still steht wird die rote LED aktiviert
         if(ili_motorcontroller_get_motor_1_state() == MOTOR_STOP)
         {
-            led_timed(ILI_LED_R, ILI_LED_MODE_STATIC);
+            led_timed(ILI_LED_R, LED_STATIC);
         }
 
         alarmcheck_start();
