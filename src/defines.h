@@ -218,7 +218,7 @@
 #define CHECK_ALARM_TIMEOUT                     K_MSEC(4000)        // Intervall für Alarmprüfung
 #define BEEP_TIMEOUT_INTERVAL                   K_MSEC(500)         // Intervall zum Beenden eines Pieptons
 #define WARN_TIMEOUT_INTERVAL                   K_MSEC(200)         // Intervall zum Wiederholen des Warntons
-#define PLUG_REACTIVATION_TIMEOUT_INTERVAL      K_MSEC(2000)        // Intervall zum Reaktivieren des Kettentasters nach Abzug der Kette
+#define PLUG_REACTIVATION_TIMEOUT_MS            2000                // Intervall zum Reaktivieren des Kettentasters nach Abzug der Kette
 #define CHECK_AUTO_CLOSE_TIMEOUT                K_MSEC(30000)       // Intervall für die Bewegungsüberprüfung nach autom. Öffnen
 #define RESET_WRONG_COLORCODE_TIMEOUT_INTERVAL  K_MSEC(180000)      // Intervall zum Prüfen der falschen Eingaben des Farbcodes
 #define HALLSENSOR_TIMEOUT_INTERVAL             K_MSEC(3000)        // Timeout bis Hallsensor Interrupt aktiviert wird

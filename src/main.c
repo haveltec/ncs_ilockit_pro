@@ -274,7 +274,6 @@ static void reset_wrong_colorcode_input_timeout_handler(struct k_timer* timer);
 static void alarm_timeout_handler(struct k_timer* timer);
 static void check_alarm_timeout_handler(struct k_timer* timer);
 static void six_min_timeout_handler(struct k_timer* timer);
-static void plug_reactivation_timeout_handler(struct k_timer* timer);
 static void bond_allowed_timeout_handler(struct k_timer* timer);
 static void auth_timeout_handler(struct k_timer* timer);
 static void gsm_send_timeout_handler(struct k_timer* timer);
@@ -437,7 +436,7 @@ static bool                     m_play_batt_warning = false;                    
 static uint8_t                  m_bl_version;                                               // Bootloader Version an Adresse im RAM;
 static bool                     m_start_factory_reset = false;                              // Gibt an, ob er Werkszustand hergestellt werden soll
 const struct device*            m_ram = DEVICE_DT_GET(DT_NODELABEL(retention0));            // Region im RAM der bei Reset erhalten bleibt
-static bool                     m_chain_temp_disabled = false;                              // Gibt an, ob die Kette temporär deaktiviert wurde
+static int64_t                  m_chain_removed_ts = -((int64_t)PLUG_REACTIVATION_TIMEOUT_MS); // Zeitpunkt des letzten Kettenabzugs (für Reaktivierungs-Timeout)
 static bool                     m_restart_allowed = false;                                  // Gibt an, ob das Schloss per Ladekabel neu gestartet werden kann
 static bool                     m_opening_was_blocked = false;                              // Gibt an, ob beim Öffnen blockiert wurde
 static uint64_t                 m_last_button_pressed_time = 0;                             // Zeitpunkt der letzten Tap-Erkennung
@@ -502,8 +501,7 @@ static uint8_t      m_colorcode_in_index = 0;                   // Zähler für 
 static uint8_t      m_colorcode_in[6];                          // Array für die Eingabe des Farbcodes über den Taster
 static uint8_t      m_colorcode[6];                             // Farbcode zur Eingabe über den Taster
 static uint8_t      m_sharecode[6];                             // Sharecode zur Eingabe über den Taster
-static uint8_t      m_colorcode_service_code_enable[6];         // Farbcode, der eingegeben werden muss um die Eingabe des Service-Codes zu starten 
-static uint8_t      m_selected_color = SELECTED_COLOR_INIT_VAL; // Gibt an, welche Farbe aktuell angezeigt wird
+static uint8_t      m_selected_color = 0;                       // Gibt an, welche Farbe aktuell angezeigt wird
 static uint8_t      m_colorcode_input_active = false;           // Flag, das angibt ob die Farbcode-Eingabe aktiv ist
 static uint8_t      m_wrong_colorcode_attempts = 0;             // Anzahl der falsch eingegebenen Farbcodes
 static bool         m_colorcode_input_allowed = true;           // Flag, das angbit, ob die Eingabe des Farbcodes erlaubt ist
@@ -639,7 +637,6 @@ struct k_timer m_reset_wrong_colorcode_input_timer;
 struct k_timer m_alarm_timer;
 struct k_timer m_check_alarm_timer;
 struct k_timer m_six_min_timer;
-struct k_timer m_plug_reactivation_timer;
 struct k_timer m_bond_allowed_timer;
 struct k_timer m_auth_timer;
 struct k_timer m_gsm_send_timer;
@@ -662,7 +659,6 @@ static void timers_init()
     k_timer_init(&m_alarm_timer, alarm_timeout_handler, NULL);
     k_timer_init(&m_check_alarm_timer, check_alarm_timeout_handler, NULL);
     k_timer_init(&m_six_min_timer, six_min_timeout_handler, NULL);
-    k_timer_init(&m_plug_reactivation_timer, plug_reactivation_timeout_handler, NULL);
     k_timer_init(&m_bond_allowed_timer, bond_allowed_timeout_handler, NULL);
     k_timer_init(&m_auth_timer, auth_timeout_handler, NULL);
     k_timer_init(&m_gsm_send_timer, gsm_send_timeout_handler, NULL);
@@ -992,7 +988,7 @@ void colorcode_input_timeout_handler(struct k_timer *timer)
     m_colorcode_in[m_colorcode_in_index] = m_selected_color;
 
     m_colorcode_in_index++;
-    m_selected_color = SELECTED_COLOR_INIT_VAL;
+    m_selected_color = 0;
     led_off();
 
     // Timer für die Eingabe der nächsten Stelle im Farbcode starten
@@ -1052,13 +1048,6 @@ void colorcode_input_timeout_handler(struct k_timer *timer)
                     m_bonding_allowed = true;
                     k_timer_start(&m_bond_allowed_timer, ONE_MIN_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
                 }
-            }
-            else if(memcmp(m_colorcode_service_code_enable, m_colorcode_in, 6) == 0)
-            {
-                // Farbcode, der zum Starten der Eingabe des Service-Codes dient, eingegeben
-                // Service-Code kann in den nächsten drei Minuten eingegeben werde
-                m_service_code_state = SERVICE_CODE_ALLOWED;
-                k_timer_start(&m_service_code_reset_timer, THREE_MIN_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
             }
             // Eingegebener Code falsch
             else
@@ -1155,13 +1144,6 @@ static void six_min_timeout_handler(struct k_timer* timer)
         m_batt_timeout_counter = 0;
         ili_battery_start();
     }
-}
-
-
-static void plug_reactivation_timeout_handler(struct k_timer* timer)
-{
-    LOG_DBG("plug_reactivation_timeout_handler");
-    m_chain_temp_disabled = false;
 }
 
 
@@ -5103,9 +5085,6 @@ void init_settings()
 
     TD("Fix für iOS FW check");
     m_bl_version = 1;
-
-    // Farbcode festlegen 6*Weiß
-    memset(m_colorcode_service_code_enable, SELECTED_COLOR_INIT_VAL, 6);
 }
 
 
@@ -5986,8 +5965,8 @@ static void evaluate_gpio_pins()
 
             if(m_factory_condition == false)
             {
-                if(m_current_locking_state != STATUS_MOTOR_1_CLOSED 
-                    && m_chain_temp_disabled == false && ili_motorcontroller_get_motor_1_state() == MOTOR_STOP)
+                if(m_current_locking_state != STATUS_MOTOR_1_CLOSED
+                    && (k_uptime_get() - m_chain_removed_ts) >= PLUG_REACTIVATION_TIMEOUT_MS && ili_motorcontroller_get_motor_1_state() == MOTOR_STOP)
                 {
                     // Kurze Pause vor Bewegungsprüfung
                     k_msleep(1000);
@@ -6008,9 +5987,8 @@ static void evaluate_gpio_pins()
             if(m_current_locking_state_chain != STATUS_MOTOR_2_CLOSED)
                 send_status(BLE_CONN_HANDLE_ALL, STATUS_CHAIN_REMOVED);
     
-            m_chain_temp_disabled = true;
-            // Timer starten, um erneutes Verriegeln mit der Kette zu ermöglichen
-            k_timer_start(&m_plug_reactivation_timer, PLUG_REACTIVATION_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
+            // Zeitpunkt merken, um erneutes Verriegeln mit der Kette erst nach Ablauf des Timeouts zuzulassen
+            m_chain_removed_ts = k_uptime_get();
         }
     }
     else if(is_pin_triggered(IRQ_MOTOR_1_OPENED))
@@ -6244,7 +6222,7 @@ void abort_colorcode_input()
 
     // eingegebenen Farbcode zurücksetzen
     m_colorcode_in_index = 0;
-    m_selected_color = SELECTED_COLOR_INIT_VAL;
+    m_selected_color = 0;
     memset(m_colorcode_in, 0, 6);
     // Farbcode-Eingabe beenden
     m_colorcode_input_active = false;
