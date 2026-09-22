@@ -333,6 +333,7 @@ K_MUTEX_DEFINE(m_rssi_mutex);                                                   
 static uint8_t          m_disconnect_device = 0;                                            // Speichert die Indizes der Geräte, deren Verbindung getrennt werden soll
 static bool             m_stop_rssi = false;
 static uint8_t          m_relock_state = RELOCK_INACTIVE;                                   // Flag für das Schließen nach automatischer Öffnung
+static bool             m_rssi_temp_disabled[CONFIG_BT_CTLR_SDC_PERIPHERAL_COUNT];          // Flags, die angeben ob der Automatikmodus für die Verbindung temporär deaktiviert ist (z.B. bei einer Watch)
 
 //////////////////////////////////////////////////////////////
 //                   App-Kommunikation                      //
@@ -353,7 +354,6 @@ static size_t                       m_sha256_len = SHA256_LENGTH;               
 static uint8_t                      m_nonce[CONFIG_BT_CTLR_SDC_PERIPHERAL_COUNT][SHA256_LENGTH];  // Zufallszahl
 static uint16_t                     m_lock_counter[CONFIG_BT_CTLR_SDC_PERIPHERAL_COUNT];          // Zähler für Schließvorgänge
 static uint16_t                     m_peer_started_bonding = BLE_CONN_HANDLE_INVALID;           // Gibt an, welcher Peer momentan ein Bonding erstellen will
-static bool                         m_reset_incompatible_app = false;                           // Flag, dass angibt ob das Schloss durch ein falsches Config-Paket in den Werkszustand gesetzt werden kann
 static const uint8_t                m_rssi_thresholds[7] = {0xFF, 60, 70, 80, 90, 50, 40};      // Umwandlung der RSSI-Einstellung in konkrete Schwellwerte. 0xFF am Anfang, weil die Einstellung bei 1 beginnt
 
 
@@ -430,7 +430,6 @@ static bool                     m_bootloader_prepare = false;                   
 static bool                     m_acc_check_passed = true;                                  // Flag, das angibt, ob der Selbsttest des Beschleunigungssensors erfolgreich war
 static bool                     m_chain_is_present = false;                                 // Flag, das angibt, ob die Einsteckkette im Schloss steckt oder nicht
 static bool                     m_charge_active = false;                                    // Flag, das angibt, ob das Schloss geladen wird
-static uint8_t                  m_service_code_state = SERVICE_CODE_INACTIVE;               // Flag, das angibt, ob die Eingabe des Service-Farbcodes erlaubt ist
 static uint8_t                  m_batt_timeout_counter = 0;                                 // Zähler um den Batteriestand alle 24h zu messen
 static bool                     m_play_batt_warning = false;                                // Flag zum Abspielen eines Warntons nach einer Batteriemessung
 static uint8_t                  m_bl_version;                                               // Bootloader Version an Adresse im RAM;
@@ -962,12 +961,6 @@ void alarm_restart_timeout_handler(struct k_timer *timer)
     alarmcheck_start();
 }
 
-// Timeout-Handler zum Zurücksetzen des Flags, das das Anlernen alter Apps verhindert
-void reset_incompatible_app_timeout_handler(struct k_timer *timer)
-{
-    LOG_DBG("reset_incompatible_app_timeout_handler");
-    m_reset_incompatible_app = false;
-}
 
 // Timeout-Handler zum Zurücksetzen des Voralarms
 void reset_prealarm_timeout_handler(struct k_timer *timer)
@@ -1001,7 +994,7 @@ void colorcode_input_timeout_handler(struct k_timer *timer)
         k_timer_stop(&m_colorcode_input_timer);
                     
         // Werkszustand per Farbcode
-        if(m_service_code_state == SERVICE_CODE_ALLOWED)
+        if(m_service_code_allowed)
         {
             LOG_DBG("Service-Farbcode erlaubt");
             // Timer zum Zurücksetzen des Flags anhalten
@@ -1011,7 +1004,7 @@ void colorcode_input_timeout_handler(struct k_timer *timer)
             {
                 LOG_DBG("Service-Farbcode korrekt");
                 //Service-Farbcode eingegeben -> Werkszustand herstellen
-                m_service_code_state = SERVICE_CODE_CORRECT;
+                all_sounds_stop();
                 motor_1_start(true);
             }
             // Eingegebener Code falsch
@@ -1019,7 +1012,7 @@ void colorcode_input_timeout_handler(struct k_timer *timer)
             {
                 LOG_DBG("Service-Farbcode falsch");
                 // Erneute Eingabe des Service-Farbcodes verbieten
-                m_service_code_state = SERVICE_CODE_INACTIVE;
+                m_service_code_allowed = false;
                 
                 // rote LED blinken lassen   
                 led_timed(LED_R, LED_ERROR);
@@ -1047,6 +1040,19 @@ void colorcode_input_timeout_handler(struct k_timer *timer)
                     // Neue Kopplung für eine gewisse Zeit erlauben, wenn Schloss geöffnet
                     m_bonding_allowed = true;
                     k_timer_start(&m_bond_allowed_timer, ONE_MIN_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
+
+                    // Diebstahlmeldung entfernen, wenn sich ein Nutzer autorisiert hat
+                    if((m_settings.theft_mode & THEFT_MODE_STOLEN) != 0)
+                    {
+                        m_settings.theft_mode ^= THEFT_MODE_STOLEN;
+                        m_update_settings = true;
+                        gsm_send(CMD_STATUS_NOT_STOLEN);
+                    }
+                    else
+                    {
+                        // GPS deaktivieren
+                        gps_off();
+                    }
                 }
             }
             // Eingegebener Code falsch
@@ -1063,6 +1069,7 @@ void colorcode_input_timeout_handler(struct k_timer *timer)
                 // Damit wird die Eingabe für 3 Minuten gesperrt
                 if(m_wrong_colorcode_attempts == 5)
                 {
+                    m_colorcode_input_allowed = false;
                     k_timer_stop(&m_reset_wrong_colorcode_input_timer);
                 }
                 
@@ -1087,6 +1094,7 @@ void colorcode_timeout_handler(struct k_timer *timer)
     // rote LED blinken lassen    
     led_timed(LED_R, LED_ERROR);
     abort_colorcode_input();
+    alarmcheck_start();
 }
 
 
@@ -1096,13 +1104,14 @@ void colorcode_timeout_handler(struct k_timer *timer)
 static void service_code_reset_timeout_handler(struct k_timer *timer)
 {
     LOG_DBG("Eingabe Service-Farbcode verbieten");
-    m_service_code_state = SERVICE_CODE_INACTIVE;
+    m_service_code_allowed = false;
 }
 
 
 static void reset_wrong_colorcode_input_timeout_handler(struct k_timer* timer)
 {
     LOG_DBG("reset_wrong_colorcode_input_timeout_handler");
+    m_colorcode_input_allowed = true;
     m_wrong_colorcode_attempts = 0;
 }
 
@@ -1126,24 +1135,71 @@ static void check_alarm_timeout_handler(struct k_timer* timer)
 
     LOG_DBG("m_check_alarm_counter = %d", m_alarmcounter);
     
-    alarmcheck_start();
+    // Bei Prüfung für autom. Schließen wird der Zähler zurückgesetzt
+    if(m_relock_state == RELOCK_MOVEMENT_CHECK)
+    {
+        m_alarmcounter = 0;
+    }
+    else
+    {
+        alarmcheck_start();
+    }
 }
 
 
 static void six_min_timeout_handler(struct k_timer* timer)
 {
-    m_batt_timeout_counter++;
+    // Wenn kein Smartphone und kein Handsender verbunden ist
+    // wird der 24h-Zähler erhöht
+    if(authorised_user_connected() == false && m_bonded_fob_connected == false)
+        m_batt_timeout_counter++;
     
     LOG_DBG("batt_timeout_handler() - %d", m_batt_timeout_counter);
 
-    // Alle 24h messen, wenn nicht gerade geöffnet wird
-    // Denn dann ist wahrscheinlich gerade eine Messung aktiv
-    if(ili_motorcontroller_get_motor_1_state != MOTOR_OPEN && m_batt_timeout_counter >= 240)
+    // Wenn es nicht als gestohlen gemeldet wurde, geht das GPS nach dem Timeout wieder aus
+    if(m_gps_active && (m_settings.theft_mode & THEFT_MODE_STOLEN) == 0)
     {
-        LOG_DBG("Spannung messen");
-        m_batt_timeout_counter = 0;
-        ili_battery_start();
+        LOG_DBG("m_gps_lpw_counter - %d", m_gps_lpw_counter);
+    
+        // GPS-Zähler erhöhen
+        m_gps_lpw_counter++;
+        // Nach 12 Min (+ x) GPS deaktivieren
+        if(m_gps_lpw_counter >= m_gps_lpw_timeout)
+        {
+            gps_off();
+        }
     }
+    
+    if(m_batt_timeout_counter >= 240)
+    {
+        // Wenn der Nutzer es konfiguriert hat gehen
+        // 4G Schlösser alle 24h online und fragen nach ihrem Diebstahlstatus
+        if(m_uicr_data.variant == VARIANT_GPS_4G && (m_settings.theft_mode & THEFT_MODE_ACTIVE) != 0)
+        {
+            gsm_send(CMD_INFO_B2C);
+            gsm_send(CMD_THEFT_REQ);
+        }
+
+        // Alle 24h messen, wenn nicht gerade geöffnet wird
+        // Denn dann ist wahrscheinlich gerade eine Messung aktiv
+        if(ili_motorcontroller_get_motor_1_state() != MOTOR_OPEN)
+        {
+            LOG_DBG("Spannung messen");
+            ili_battery_start();
+        }
+        
+        m_batt_timeout_counter = 0;
+    }
+    
+    // Beim ersten Durchlaufen des Timers wird der Neustart per Ladekabel aktiviert
+    m_restart_allowed = true;
+    
+    // Läuft das Schloss lange genug, war der letzte Start offenbar erfolgreich.
+    // m_safe_mode bleibt davon unberührt und gilt bis zum nächsten Start weiter.
+    //ili_error_reset_unstable_boot();
+    
+    // Falls das Advertising aus irgendeinem Grund nicht aktiv ist, wird es neu gestartet
+    advertising_start();
 }
 
 
@@ -1256,6 +1312,8 @@ void gsm_send_timeout_handler(struct k_timer* timer)
 
 void button_timeout_handler(struct k_timer* timer)
 {
+    m_button_counter++;
+
     if(m_factory_condition)
         return;
 
@@ -1269,8 +1327,8 @@ void button_timeout_handler(struct k_timer* timer)
         
         // Motoren nicht aktiv, Farbcode-Eingabe erlaubt, BLE nicht verbunden und Ladekabel steckt ->
         // Nach 30 Sek. wird die rote LED eingeschaltet um die Eingabe des Service-Farbcodes zu signalisieren
-        if(m_button_counter == 600 && ili_motorcontroller_get_motor_1_state() == MOTOR_STOP && ili_motorcontroller_get_motor_2_state() == MOTOR_STOP && m_colorcode_input_allowed
-            && m_peripheral_conn_count == 0 && m_charge_active)
+        if(m_button_counter == 600 && ili_motorcontroller_get_motor_1_state() == MOTOR_STOP && ili_motorcontroller_get_motor_2_state() == MOTOR_STOP 
+            && m_colorcode_input_allowed && m_peripheral_conn_count == 0 && m_charge_active)
         {
             
             LOG_DBG("Counter = 600");
@@ -1294,8 +1352,6 @@ void button_timeout_handler(struct k_timer* timer)
         if(m_button_counter == 600 && m_charge_active)
             led(LED_R);
     }
-        
-    m_button_counter++;
 }
 
 
@@ -1806,6 +1862,7 @@ uint8_t delete_peer_data(uint16_t auth_id)
     LOG_HEXDUMP_DBG(m_peer_data[auth_id].hw_id, HW_ID_LEN, "Datensatz gelöscht");
     
 	// Peer-Daten löschen
+    // Der LTK wird in der main aus dem Secure Storage entfernt
 	m_peer_data[auth_id].auth_id = auth_id;
 	memset(m_peer_data[auth_id].hw_id, 0xFF, HW_ID_LEN);
 	m_peer_data[auth_id].is_used = false;
@@ -1849,7 +1906,7 @@ static bool authorised_user_is_nearby()
 {
     for(uint8_t i = 0; i < CONFIG_BT_CTLR_SDC_PERIPHERAL_COUNT; i++)
     {
-        if(m_auth_state[i] == AUTHORISED && m_rssi_user_state[i] == RSSI_STATE_NEAR)
+        if(m_connected_peer[i].used && m_auth_state[i] == AUTHORISED && m_rssi_user_state[i] == RSSI_STATE_NEAR)
         {
             return true;
         }
@@ -1910,7 +1967,10 @@ static void ble_services_init()
 
     // BLE-Zustände initialisieren
     for(uint8_t i = 0; i < CONFIG_BT_CTLR_SDC_PERIPHERAL_COUNT; i++)
+    {
         m_auth_state[i] = UNAUTHORISED;
+        m_rssi_temp_disabled[i] = false;
+    }
 
     // Device-Name setzen
     bt_set_name(m_uicr_data.advertising_name);
@@ -2412,6 +2472,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
                 
             // RSSI-Zustand zurücksetzen
             m_rssi_user_state[peripheral->index] = RSSI_STATE_FAR;
+            m_rssi_temp_disabled[peripheral->index] = false;
             
         }
 
@@ -2671,6 +2732,14 @@ const char *rssi_str(uint8_t state)
  */
 static void rssi_check(uint16_t conn_handle, uint8_t rssi_new)
 {    
+
+        // Wenn der Automatikmodus für die aktuelle Verbindung temporär deaktiviert wurde, 
+    // dann wird die Funktion wieder verlassen
+    if(m_rssi_temp_disabled[conn_handle])
+    {
+        return;
+    }
+
 //	LOG_DBG("rssi_check for device %d with RSSI %d", conn_handle, rssi_new);
 	// Mittelwert der letzten 10 Werte errechnen
     m_rssi_avg[conn_handle] = movingAvg(m_rssi_values[conn_handle], &m_rssi_sum[conn_handle], m_rssi_pos[conn_handle], RSSI_AVG_COUNT, rssi_new);
@@ -2724,6 +2793,10 @@ static void rssi_check(uint16_t conn_handle, uint8_t rssi_new)
         // Nicht direkt aufrufen: rssi_check() läuft im RSSI-Thread, motor_1_start()
         // würde über rssi_stop() versuchen, genau diesen Thread zu suspendieren
         k_work_submit(&work_rssi_auto_open);
+        if(m_settings.auto_open[m_connected_peer[conn_handle].peer_data->auth_id].auto_close_active)
+        {
+            m_relock_state = RELOCK_AUTO_OPENED;
+        }
     }
     
     // Aktuellen Zustand setzen
@@ -3120,6 +3193,16 @@ void gdio_data_received(uint16_t conn_handle)
         }
         break; // case AUTH_ID_CONF
      
+        case IGNORE_AUTO_MODE:
+        {
+            LOG_DBG("IGNORE_AUTO_MODE for conn %d", conn_handle);
+            m_rssi_temp_disabled[conn_handle] = true;
+            
+            // Erfolg melden
+            send_status(conn_handle, STATUS_SUCCESS);
+        }
+        break; // IGNORE_AUTO_MODE
+
     } // switch(m_command)
 }
 
@@ -3629,45 +3712,53 @@ void usdio_data_received(uint16_t conn_handle)
                 break;
             }
             
-            // Befehlsargument auswerten
-            switch(m_usdio_message_in[conn_handle].payload[2])
+            if(m_bonding_mode_active == false)
             {
-                LOG_DBG("Lock cmd = %d", m_usdio_message_in[conn_handle].payload[2]);
-                // Aufschließen
-                case LOCK_ACTION_OPEN:
+                // Befehlsargument auswerten
+                switch(m_usdio_message_in[conn_handle].payload[2])
                 {
-                    motor_1_start(true);
-                }
-                break;
-                
-                // Zuschließen
-                case LOCK_ACTION_CLOSE:
-                {
-                    motor_1_start(false);
-                }
-                break;
+                    LOG_DBG("Lock cmd = %d", m_usdio_message_in[conn_handle].payload[2]);
+                    // Aufschließen
+                    case LOCK_ACTION_OPEN:
+                    {
+                        motor_1_start(true);
+                    }
+                    break;
+                    
+                    // Zuschließen
+                    case LOCK_ACTION_CLOSE:
+                    {
+                        motor_1_start(false);
+                    }
+                    break;
 
-                // Motor 2 aufschließen
-                case LOCK_ACTION_OPEN_CHAIN:
-                {
-                    motor_2_start(true, true);
-                }
-                break;
-                
-                // Motor 2 zuschließen
-                case LOCK_ACTION_CLOSE_CHAIN:
-                {
-                    motor_2_start(false, true);
-                }
-                break;
-                
-                default:
-                {
-                    // Fehlercode an App senden
-                    send_status(conn_handle, STATUS_ERR_NOT_ALLOWED);
-                }
-                break;
-            } //switch(m_usdio_message_in[conn_handle].payload[2])
+                    // Motor 2 aufschließen
+                    case LOCK_ACTION_OPEN_CHAIN:
+                    {
+                        motor_2_start(true, true);
+                    }
+                    break;
+                    
+                    // Motor 2 zuschließen
+                    case LOCK_ACTION_CLOSE_CHAIN:
+                    {
+                        motor_2_start(false, true);
+                    }
+                    break;
+                    
+                    default:
+                    {
+                        // Fehlercode an App senden
+                        send_status(conn_handle, STATUS_ERR_NOT_ALLOWED);
+                    }
+                    break;
+                } //switch(m_usdio_message_in[conn_handle].payload[2])
+            }
+            else
+            {
+                // Fehler an App senden
+                send_status(conn_handle, STATUS_ERR_BONDING_ACTIVE);
+            }
 		}
         break; // case LOCK_ACTION
         
@@ -3989,7 +4080,7 @@ void usdio_data_received(uint16_t conn_handle)
                 {
                     m_settings.auto_open[m_connected_peer[conn_handle].peer_data->auth_id].active =  m_usdio_message_in[conn_handle].payload[0];
                     m_settings.auto_open[m_connected_peer[conn_handle].peer_data->auth_id].threshold = m_usdio_message_in[conn_handle].payload[1];
-                    m_settings.auto_open[m_connected_peer[conn_handle].peer_data->auth_id].auto_close_active = m_usdio_message_in[conn_handle].payload[2];
+                    m_settings.auto_open[m_connected_peer[conn_handle].peer_data->auth_id].auto_close_active = true; //m_usdio_message_in[conn_handle].payload[2];
                     
                     m_update_settings = true;
                 }
@@ -4106,6 +4197,15 @@ void usdio_data_received(uint16_t conn_handle)
                 m_dnd_mode_active = true;
                 LOG_DBG("Nicht-Stören Modus aktiviert");
                 
+                // Falls nötig, Alarmauswertung stoppen
+                alarmcheck_stop();
+
+                // Prüfung für autom. Schließen oder RSSI-Auswertung stoppen
+                if(m_relock_state != RELOCK_INACTIVE)
+                    relock_check_stop();
+                else if(m_current_locking_state != STATUS_MOTOR_1_OPENED)
+                    rssi_stop();
+
                 // Erfolg melden
                 send_status(conn_handle, STATUS_SUCCESS);
             }
@@ -4453,7 +4553,7 @@ static void motor_1_start(bool direction_open)
             // daher wird hier danach unterschieden
             if(auto_close)
                 beep_start(ILI_PIEZO_SOUND_AUTO_CLOSE);
-            else\
+            else
                 beep_start(ILI_PIEZO_SOUND_CLOSE);
         }
         // Wenn Bewegung erkannt wurde ist der Selbsttest nicht gültig
@@ -4527,10 +4627,11 @@ static void motor_1_start(bool direction_open)
 */
 void alarmcheck_start()
 {
-    if(m_settings.alarm.armed && m_factory_condition == false
+    if(m_settings.alarm.armed && m_factory_condition == false && m_dnd_mode_active == false
         && ili_motorcontroller_get_motor_1_state() == MOTOR_STOP
+        && ili_motorcontroller_get_motor_2_state() == MOTOR_STOP
         && m_alarmsound_active == false && m_prealarm_active == false 
-        && m_current_locking_state == STATUS_MOTOR_1_CLOSED)
+        && m_current_locking_state != STATUS_MOTOR_1_OPENED)
     {
         LOG_DBG("alarmcheck_start()");
 
@@ -4550,12 +4651,17 @@ void alarmcheck_start()
 */
 void alarmcheck_stop()
 {
-    LOG_DBG("alarmcheck_stop()");
+    // Beschleunigungssensor nur in den Sleep-Mode setzen, 
+    // wenn er nicht vom Relock benötigt wird
+    if(m_relock_state != RELOCK_MOVEMENT_CHECK)
+    {
+        LOG_DBG("alarmcheck_stop()");
 
-    k_work_submit(&work_acc_sleep);
-    gpio_remove_callback(pin_accel_int1.port, &accel_int1_cb_data);
+        k_work_submit(&work_acc_sleep);
+        gpio_remove_callback(pin_accel_int1.port, &accel_int1_cb_data);
 
-    k_timer_stop(&m_check_alarm_timer);
+        k_timer_stop(&m_check_alarm_timer);
+    }
 }
 
 
@@ -5070,7 +5176,7 @@ void init_settings()
     for(uint8_t i = 0; i < MAX_PEER_COUNT; i++)
     {
         m_settings.auto_open[i].active = true;
-        m_settings.auto_open[i].auto_close_active = false;
+        m_settings.auto_open[i].auto_close_active = true;
         m_settings.auto_open[i].threshold = m_rssi_thresholds[2];
         m_settings.auto_open[i].ble_settings = 3;
         m_settings.auto_open[i].ble_threshold = 2;
@@ -5078,7 +5184,8 @@ void init_settings()
     
     m_settings.sound.mode = SOUND_CONF_CLOSE | SOUND_CONF_WARNING | SOUND_CONF_OPEN;
     m_settings.sound.ble = 6;
-    memset(m_settings.reserved, 0, 32);
+    m_settings.theft_mode = 0;
+    memset(m_settings.reserved, 0, RESERVED_BYTES);
 
     if(retention_is_valid(m_ram))
         retention_read(m_ram, RAM_BLVERSION_OFFSET, &m_bl_version, 1);    
@@ -5530,7 +5637,7 @@ void uart_gsm_send(uint8_t command)
                         
             gsm_msg_tx[3]  = 16;
             gsm_msg_tx[4]  = FIRMWARE_MAJOR;
-            gsm_msg_tx[5]  = 100;//ili_battery_get_value();
+            gsm_msg_tx[5]  = ili_battery_get_value();
             gsm_msg_tx[6]  = m_current_locking_state;
             gsm_msg_tx[7]  = FIRMWARE_MINOR;
             gsm_msg_tx[8]  = (gpio_pin_get_dt(&pin_charge) == 0);
@@ -5815,7 +5922,7 @@ void do_button_action()
             // Autorisierter Nutzer in der Nähe
             else
             {
-                ili_motorcontroller_motor_1_start(true);
+                motor_1_start(true);
 
                 // Wenn das Schloss nicht geöffnet wird, blinkt die rote LED
                 if(ili_motorcontroller_get_motor_1_state() == MOTOR_STOP)
@@ -5845,7 +5952,7 @@ void do_button_action()
             {
                 led_timed(LED_R, LED_STATIC);
                 
-                ili_motorcontroller_motor_1_start(false);
+                motor_1_start(false);
                 m_last_button_pressed_time = 0;
                 
                 // Wenn das Schloss geschlossen wird, Taster kurz deaktivieren
@@ -5894,8 +6001,8 @@ void do_button_action()
                     m_current_locking_state_chain = STATUS_MOTOR_2_LOCK_STATE_UNKNOWN;
                 }
                 
-                ili_motorcontroller_motor_1_start(true);
-                ili_motorcontroller_motor_2_start(true);
+                motor_1_start(true);
+                motor_2_start(true, true);
                 
                 m_testmode_state |= TEST_MECHANIC;
                 m_actual_test = TEST_MECHANIC;
@@ -5918,7 +6025,7 @@ static void evaluate_gpio_pins()
     {
         LOG_DBG("IRQ_CHARGE_STARTED");
         
-        m_charge_active = false;
+        m_charge_active = true;
 
         if(!m_bonding_mode_active && (m_needed_tests & TEST_GSM) == 0)
             led_faded(LED_R, LED_CHARGING);
@@ -5961,20 +6068,28 @@ static void evaluate_gpio_pins()
 
         if(m_chain_is_present)
         {
-            send_status(BLE_CONN_HANDLE_ALL, STATUS_CHAIN_CONNECTED);
-
             if(m_factory_condition == false)
             {
-                if(m_current_locking_state != STATUS_MOTOR_1_CLOSED
-                    && (k_uptime_get() - m_chain_removed_ts) >= PLUG_REACTIVATION_TIMEOUT_MS && ili_motorcontroller_get_motor_1_state() == MOTOR_STOP)
+                if(m_bonding_mode_active == false)
                 {
-                    // Kurze Pause vor Bewegungsprüfung
-                    k_msleep(1000);
-                    motor_1_start(false);
+                    send_status(BLE_CONN_HANDLE_ALL, STATUS_CHAIN_CONNECTED);
+
+                    if(m_current_locking_state != STATUS_MOTOR_1_CLOSED
+                        && (k_uptime_get() - m_chain_removed_ts) >= PLUG_REACTIVATION_TIMEOUT_MS && ili_motorcontroller_get_motor_1_state() == MOTOR_STOP)
+                    {
+                        // Kurze Pause vor Bewegungsprüfung
+                        k_msleep(1000);
+                        motor_1_start(false);
+                    }
+                    else
+                    {
+                        motor_2_start(false, false);
+                    }
                 }
                 else
                 {
-                    motor_2_start(false, false);
+                    // Fehler an App senden, wenn per Kette geschlossen werden soll
+                    send_status(BLE_CONN_HANDLE_ALL, STATUS_ERR_BONDING_ACTIVE);
                 }
             }
             else if(m_needed_tests == TEST_MECHANIC && m_actual_test == 6)
@@ -6713,6 +6828,9 @@ int main(void)
         // Alarm scharf schalten, wenn geschlossen
 		alarmcheck_start();
 
+        // Prüfen, ob Diebstahlmeldung vorhanden ist
+        if(m_uicr_data.variant == VARIANT_GPS_4G && (m_settings.theft_mode & THEFT_MODE_ACTIVE) != 0)
+            gsm_send(CMD_THEFT_REQ);
         //m_start_factory_reset = true;
 	}
 	else

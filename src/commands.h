@@ -39,8 +39,9 @@
 #define DFU_CHALLENGE                       0x0022
 #define GPS_UUID                            0x0023
 #define GPS_SIGNAL                          0x0024
-#define AUTO_OPEN_SETTINGS                  0x0025  // Befehl f�r den neuen Automatikmodus
-#define ALARM_SETTINGS_PRO                  0x0026  // Befehl f�r die neue Alarmeinstellung
+#define AUTO_OPEN_SETTINGS                  0x0025 // Befehl für den neuen Automatikmodus
+#define ALARM_SETTINGS_PRO                  0x0026 // Befehl für die neue Alarmeinstellung
+#define IGNORE_AUTO_MODE                    0x0028 // Befehl von einer Apple Watch um den Automatikmodus temporär für die Verbindung zu deaktivieren
 
 ////////// STATUSCODES ////////////
 #define STATUS_SUCCESS                      0x00
