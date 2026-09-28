@@ -6769,7 +6769,8 @@ int main(void)
 
     // CAN-Controller initialisieren und sofort in den Standby legen
     ili_can_init();
-
+    ili_can_listen_start();   // nur fuer die Inbetriebnahme
+    
     ble_services_init();
 
     advertising_init();
