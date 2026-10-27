@@ -49,6 +49,8 @@ target_sources(app PRIVATE ../../libs/led/ili_led.c)
 
 target_include_directories(app PRIVATE ../../libs/can)
 target_sources(app PRIVATE ../../libs/can/ili_can.c)
+target_sources(app PRIVATE ../../libs/can/ili_can_matrix.c)
+target_sources(app PRIVATE ../../libs/can/ili_can_auth.c)
 
 
 # NORDIC SDK APP END

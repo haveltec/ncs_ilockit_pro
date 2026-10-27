@@ -61,6 +61,7 @@
 #include "ili_piezo.h"
 #include "ili_led.h"
 #include "ili_can.h"
+#include "ili_can_auth.h"
 #include "commands.h"
 #include "defines.h"
 
@@ -6683,6 +6684,73 @@ enum mgmt_cb_return mcumgr_dfu_handler(uint32_t event, enum mgmt_cb_return prev_
 }
 
 
+/**@brief   Sendet die eLock-Identifikation (Spezifikation 11.4).
+ *
+ * Beide Nachrichten muessen innerhalb von 1 s nach der Anfrage beim eBike-System
+ * sein, sonst wiederholt es die Anfrage und bricht nach drei Versuchen ab.
+ */
+static void can_send_identification(void)
+{
+    uint8_t buf[ILI_CAN_MATRIX_DLEN];
+    char    model[ILI_CAN_MATRIX_STRING_LEN + 1];
+    char    serial[ILI_CAN_MATRIX_STRING_LEN + 1];
+    char    sw_version[ILI_CAN_MATRIX_STRING_LEN + 1];
+    char    hw_version[ILI_CAN_MATRIX_STRING_LEN + 1];
+
+    snprintf(model, sizeof(model), "%c%c%c", m_uicr_data.product_type, m_uicr_data.variant, m_uicr_data.subvariant);
+    snprintf(serial, sizeof(serial), "%05u", m_uicr_data.serial_number);
+    snprintf(sw_version, sizeof(sw_version), "%d.%d", FIRMWARE_MAJOR, FIRMWARE_MINOR);
+    snprintf(hw_version, sizeof(hw_version), "%u", m_uicr_data.hardware_version);
+
+    ili_can_matrix_identification1_pack(buf, ili_can_elock_version(),
+                                        "haveltec GmbH", "ILOCKIT PRO", model,
+                                        ILI_CAN_LOCKTYPE_FRAME);
+    if(ili_can_elock_send(buf) != 0)
+    {
+        LOG_WRN("CAN: Identification1 konnte nicht gesendet werden");
+        return;
+    }
+
+    ili_can_matrix_identification2_pack(buf, ili_can_elock_version(),
+                                        serial, sw_version, hw_version);
+    if(ili_can_elock_send(buf) != 0)
+    {
+        LOG_WRN("CAN: Identification2 konnte nicht gesendet werden");
+        return;
+    }
+
+    LOG_INF("CAN: Identifikation gesendet (Modell %s, SN %s, SW %s, HW %s)",
+            model, serial, sw_version, hw_version);
+}
+
+
+static void can_rx_handler(const uint8_t* p_data, void* p_user)
+{
+    if(ili_can_auth_handle(p_data))
+        return;
+
+    // Vor erfolgreicher Authentifizierung darf laut Spezifikation 12.2
+    // nichts anderes verarbeitet werden
+    if(ili_can_auth_state() != ILI_CAN_AUTH_STATE_DONE)
+        return;
+
+    switch(ili_can_matrix_rx_type(p_data))
+    {
+        case ILI_CAN_BRC_INTERACTION:
+        {
+            ili_can_brc_requests_t req;
+            ili_can_matrix_rx_requests(p_data, &req);
+
+            if(req.req_identification_data)
+                can_send_identification();
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
 int main(void)
 {
 	int err;
@@ -6769,7 +6837,9 @@ int main(void)
 
     // CAN-Controller initialisieren und sofort in den Standby legen
     ili_can_init();
-    ili_can_listen_start();   // nur fuer die Inbetriebnahme
+    ili_can_auth_init();
+    ili_can_elock_set_state(ILI_CAN_LOCK_UNKNOWN, ILI_CAN_BOND_UNBONDED, true);
+    ili_can_elock_start(1, can_rx_handler, NULL);
     
     ble_services_init();
 
