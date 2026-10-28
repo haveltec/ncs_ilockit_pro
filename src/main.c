@@ -62,6 +62,7 @@
 #include "ili_led.h"
 #include "ili_can.h"
 #include "ili_can_auth.h"
+#include "ili_can_bond.h"
 #include "commands.h"
 #include "defines.h"
 
@@ -6734,6 +6735,15 @@ static void can_rx_handler(const uint8_t* p_data, void* p_user)
     if(ili_can_auth_state() != ILI_CAN_AUTH_STATE_DONE)
         return;
 
+    if(ili_can_bond_handle(p_data))
+    {
+        // Heartbeat meldet ab dem bestandenen Bond-Check "bonded"
+        ili_can_elock_set_state(ILI_CAN_LOCK_UNKNOWN,
+                                ili_can_bond_is_bonded() ? ILI_CAN_BOND_BONDED : ILI_CAN_BOND_UNBONDED,
+                                !ili_can_bond_is_bonded());
+        return;
+    }
+
     switch(ili_can_matrix_rx_type(p_data))
     {
         case ILI_CAN_BRC_INTERACTION:
@@ -6743,6 +6753,9 @@ static void can_rx_handler(const uint8_t* p_data, void* p_user)
 
             if(req.req_identification_data)
                 can_send_identification();
+
+            if(req.req_nonce)
+                ili_can_bond_nonce_request();
             break;
         }
 
