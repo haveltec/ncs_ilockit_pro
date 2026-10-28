@@ -6311,6 +6311,9 @@ void factory_reset()
         psa_destroy_key(ZEPHYR_PSA_APPLICATION_KEY_ID_RANGE_BEGIN + i);
     }
 
+    // Bond mit dem Bosch-eBike-System lösen (Spezifikation 14.2: Werksreset)
+    ili_can_bond_reset();
+
     // err = fmna_disable();
 	// if (err) {
 	// 	LOG_DBG("fmna_disable failed (err: %d)", err);
@@ -6851,7 +6854,10 @@ int main(void)
     // CAN-Controller initialisieren und sofort in den Standby legen
     ili_can_init();
     ili_can_auth_init();
-    ili_can_elock_set_state(ILI_CAN_LOCK_UNKNOWN, ILI_CAN_BOND_UNBONDED, true);
+    bool can_bonded = ili_can_bond_init();
+    ili_can_elock_set_state(ILI_CAN_LOCK_UNKNOWN,
+                            can_bonded ? ILI_CAN_BOND_BONDED : ILI_CAN_BOND_UNBONDED,
+                            !can_bonded);
     ili_can_elock_start(1, can_rx_handler, NULL);
     
     ble_services_init();
