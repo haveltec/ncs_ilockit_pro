@@ -7003,11 +7003,11 @@ int main(void)
 
     // CAN-Controller initialisieren und sofort in den Standby legen
     ili_can_init();
-//    ili_can_auth_init();
-//    ili_can_bond_init();
-//    ili_can_bond_set_cmd_handler(can_cmd_handler);
-//    can_update_heartbeat();
-//    ili_can_elock_start(1, can_rx_handler, NULL);
+    ili_can_auth_init();
+    ili_can_bond_init();
+    ili_can_bond_set_cmd_handler(can_cmd_handler);
+    can_update_heartbeat();
+    ili_can_elock_start(1, can_rx_handler, NULL);
     
     ble_services_init();
 
