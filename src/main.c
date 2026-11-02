@@ -979,9 +979,6 @@ void colorcode_input_timeout_handler(struct k_timer *timer)
 {
     LOG_DBG("----------colorcode_input_timeout_handler");
 
-    // Gewählte Farbe festlegen
-    m_colorcode_in[m_colorcode_in_index] = m_selected_color;
-
     m_colorcode_in_index++;
     m_selected_color = 0;
     led_off();
@@ -6728,6 +6725,142 @@ static void can_send_identification(void)
 }
 
 
+/*
+ * Lock/Unlock vom eBike-System (Spezifikation 12.7/12.8)
+ *
+ * Das Kommando kommt im CAN-Empfangsthread an, ausgefuehrt wird es in der
+ * Main-Schleife - wie LOCK_ACTION per BLE, weil motor_1_start() beim
+ * Schliessen ~2,2 s auf den Beschleunigungssensor wartet. Das Ergebnis sieht
+ * das eBike-System am LockState im Heartbeat; scheitert das Kommando, kommt
+ * zusaetzlich eine IssueInfo.
+ */
+/*
+ * Gemeldete Dauer = laengste moegliche Dauer: bis zum Motor-Timeout. Spaetestens
+ * dann steht das Ergebnis fest - Endlage erreicht oder blockiert (IssueInfo).
+ * Beim Schliessen kommt die Bewegungspruefung davor dazu (100 Samples, ~2,2 s).
+ */
+#define CAN_ACC_CHECK_S         3
+#define CAN_UNLOCK_DURATION_S   ((ILI_MOTORCONTROLLER_TIMEOUT_MS + 999) / 1000)
+#define CAN_LOCK_DURATION_S     (CAN_UNLOCK_DURATION_S + CAN_ACC_CHECK_S)
+#define CAN_CMD_SETTLE_PASSES   2       // Motor so viele Schleifendurchlaeufe still, bevor ausgewertet wird
+
+static volatile uint8_t m_can_cmd_request = 0;     // ILI_CAN_CMD_LOCK/UNLOCK, 0 = nichts angefordert
+static uint8_t          m_can_cmd_running = 0;     // Kommando, dessen Ergebnis noch aussteht
+static uint8_t          m_can_cmd_settle  = 0;
+
+
+/**@brief   LockState fuer den Heartbeat aus dem Zustand von Motor 1 (Buegel). */
+static ili_can_lock_state_t can_lock_state(void)
+{
+    if(ili_motorcontroller_get_motor_1_state() != MOTOR_STOP)
+        return ILI_CAN_LOCK_INTERMEDIATE;
+
+    switch(m_current_locking_state)
+    {
+        case STATUS_MOTOR_1_CLOSED: return ILI_CAN_LOCK_LOCKED;
+        case STATUS_MOTOR_1_OPENED: return ILI_CAN_LOCK_UNLOCKED;
+        default:                    return ILI_CAN_LOCK_UNKNOWN;
+    }
+}
+
+
+/**@brief   Aktualisiert den Inhalt des Heartbeats. */
+static void can_update_heartbeat(void)
+{
+    bool bonded = ili_can_bond_is_bonded();
+
+    ili_can_elock_set_state(can_lock_state(),
+                            bonded ? ILI_CAN_BOND_BONDED : ILI_CAN_BOND_UNBONDED,
+                            !bonded);
+}
+
+
+/**@brief   Nimmt ein gueltig signiertes Lock/Unlock entgegen (CAN-Empfangsthread). */
+static int can_cmd_handler(ili_can_secure_cmd_t cmd, uint8_t* p_duration)
+{
+    // Ein Kommando nach dem anderen; waehrend des BLE-Bondings sperrt
+    // motor_1_start() ohnehin
+    if(m_can_cmd_request != 0 || m_can_cmd_running != 0 || m_bonding_mode_active)
+        return -EBUSY;
+
+    *p_duration       = (cmd == ILI_CAN_CMD_LOCK) ? CAN_LOCK_DURATION_S : CAN_UNLOCK_DURATION_S;
+    m_can_cmd_request = cmd;
+
+    return 0;
+}
+
+
+/**@brief   Fuehrt ein angefordertes Kommando aus und wertet es aus (Main-Schleife). */
+static void can_cmd_process(void)
+{
+    uint8_t cmd = m_can_cmd_request;
+
+    if(cmd != 0)
+    {
+        m_can_cmd_request = 0;
+
+        bool lock   = (cmd == ILI_CAN_CMD_LOCK);
+        bool target = lock ? (m_current_locking_state == STATUS_MOTOR_1_CLOSED)
+                           : (m_current_locking_state == STATUS_MOTOR_1_OPENED);
+
+        // Schon in der Zielstellung: nichts zu tun, der Heartbeat zeigt es bereits
+        if(target)
+            return;
+
+        motor_1_start(!lock);
+
+        // Beim Schliessen hat motor_1_start() Bewegung erkannt und abgebrochen
+        if(lock && !m_acc_check_passed &&
+           ili_motorcontroller_get_motor_1_state() == MOTOR_STOP)
+        {
+            LOG_WRN("CAN: Lock abgelehnt - Bewegung erkannt");
+            ili_can_bond_report_issue(ILI_CAN_ISSUE_LOCK_WHILE_MOVING);
+            return;
+        }
+
+        m_can_cmd_running = cmd;
+        m_can_cmd_settle  = 0;
+        return;
+    }
+
+    if(m_can_cmd_running == 0)
+        return;
+
+    /*
+     * Fertig, wenn der Motor steht. Erst nach mehreren stillen Durchlaeufen
+     * auswerten: der Motor meldet MOTOR_STOP, bevor evaluate_gpio_pins() die
+     * Endlage in m_current_locking_state uebernommen hat.
+     */
+    if(ili_motorcontroller_get_motor_1_state() != MOTOR_STOP || m_triggered_pins != 0)
+    {
+        m_can_cmd_settle = 0;
+        return;
+    }
+
+    if(++m_can_cmd_settle < CAN_CMD_SETTLE_PASSES)
+        return;
+
+    bool lock = (m_can_cmd_running == ILI_CAN_CMD_LOCK);
+
+    m_can_cmd_running = 0;
+
+    if(lock && m_current_locking_state != STATUS_MOTOR_1_CLOSED)
+    {
+        LOG_ERR("CAN: Lock fehlgeschlagen (Zustand 0x%02X)", m_current_locking_state);
+        ili_can_bond_report_issue(ILI_CAN_ISSUE_LOCKING_FAILED);
+    }
+    else if(!lock && m_current_locking_state != STATUS_MOTOR_1_OPENED)
+    {
+        LOG_ERR("CAN: Unlock fehlgeschlagen (Zustand 0x%02X)", m_current_locking_state);
+        ili_can_bond_report_issue(ILI_CAN_ISSUE_UNLOCKING_FAILED);
+    }
+    else
+    {
+        LOG_INF("CAN: %s ausgefuehrt", lock ? "Lock" : "Unlock");
+    }
+}
+
+
 static void can_rx_handler(const uint8_t* p_data, void* p_user)
 {
     if(ili_can_auth_handle(p_data))
@@ -6740,10 +6873,8 @@ static void can_rx_handler(const uint8_t* p_data, void* p_user)
 
     if(ili_can_bond_handle(p_data))
     {
-        // Heartbeat meldet ab dem bestandenen Bond-Check "bonded"
-        ili_can_elock_set_state(ILI_CAN_LOCK_UNKNOWN,
-                                ili_can_bond_is_bonded() ? ILI_CAN_BOND_BONDED : ILI_CAN_BOND_UNBONDED,
-                                !ili_can_bond_is_bonded());
+        // Bond-Zustand kann sich geaendert haben (Bonding, Bond-Reset)
+        can_update_heartbeat();
         return;
     }
 
@@ -6825,8 +6956,9 @@ int main(void)
     
     LOG_HEXDUMP_INF(m_uicr_data.reset_code, 6, "Click-Code: ");
 
-    //LOG_RAW("App-ID: 0x%.4X", m_uicr_data.app_id_msb);
-    //LOG_RAW("%.4X\n", m_uicr_data.app_id_lsb);
+    LOG_INF("App-ID: 0x%.4X", m_uicr_data.app_id_msb);
+    LOG_INF("%.4X\n", m_uicr_data.app_id_lsb);
+
 
 	err = crypto_init();
 	if (err) {
@@ -6853,12 +6985,11 @@ int main(void)
 
     // CAN-Controller initialisieren und sofort in den Standby legen
     ili_can_init();
-    ili_can_auth_init();
-    bool can_bonded = ili_can_bond_init();
-    ili_can_elock_set_state(ILI_CAN_LOCK_UNKNOWN,
-                            can_bonded ? ILI_CAN_BOND_BONDED : ILI_CAN_BOND_UNBONDED,
-                            !can_bonded);
-    ili_can_elock_start(1, can_rx_handler, NULL);
+//    ili_can_auth_init();
+//    ili_can_bond_init();
+//    ili_can_bond_set_cmd_handler(can_cmd_handler);
+//    can_update_heartbeat();
+//    ili_can_elock_start(1, can_rx_handler, NULL);
     
     ble_services_init();
 
@@ -7133,6 +7264,10 @@ TD("TODOs:");
             m_start_factory_reset = false;
             factory_reset();
         }
+
+        // Lock/Unlock vom eBike-System ausfuehren und den Heartbeat nachziehen
+        can_cmd_process();
+        can_update_heartbeat();
 
         if(m_restart_lock)
         {
