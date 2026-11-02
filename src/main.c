@@ -500,6 +500,7 @@ static bool                         m_update_settings = false;              // F
 static bool         m_write_click_code = false;                 // Flag zum Überprüfen des Schreibvorgangs bei Ersteinrichtung
 static uint8_t      m_colorcode_in_index = 0;                   // Zähler für Position in click_code_in
 static uint8_t      m_colorcode_in[6];                          // Array für die Eingabe des Farbcodes über den Taster
+static uint8_t      m_colorcode_eval[6];                        // Kopie des eingegebenen Farbcodes für die Auswertung in der Workqueue
 static uint8_t      m_colorcode[6];                             // Farbcode zur Eingabe über den Taster
 static uint8_t      m_sharecode[6];                             // Sharecode zur Eingabe über den Taster
 static uint8_t      m_selected_color = 0;                       // Gibt an, welche Farbe aktuell angezeigt wird
@@ -972,6 +973,108 @@ void reset_prealarm_timeout_handler(struct k_timer *timer)
 }
 
 
+/**@brief Auswertung des vollständig eingegebenen Farbcodes
+ *
+ * Läuft in der System-Workqueue, weil colorcode_input_timeout_handler() als
+ * Timer-Callback im ISR-Kontext läuft. Dort dürfen motor_1_start() (rssi_stop()
+ * sperrt einen Mutex, ili_battery_start() initialisiert den SAADC), gsm_send()
+ * und gps_off() nicht aufgerufen werden.
+ */
+static void work_colorcode_evaluate_handler(struct k_work* work)
+{
+    LOG_DBG("Farbcode komplett");
+
+    // Werkszustand per Farbcode
+    if(m_service_code_allowed)
+    {
+        LOG_DBG("Service-Farbcode erlaubt");
+        // Timer zum Zurücksetzen des Flags anhalten
+        k_timer_stop(&m_service_code_reset_timer);
+        
+        if(memcmp(m_uicr_data.reset_code, m_colorcode_eval, 6) == 0)
+        {
+            LOG_DBG("Service-Farbcode korrekt");
+            //Service-Farbcode eingegeben -> Werkszustand herstellen
+            all_sounds_stop();
+            motor_1_start(true);
+        }
+        // Eingegebener Code falsch
+        else
+        {
+            LOG_DBG("Service-Farbcode falsch");
+            // Erneute Eingabe des Service-Farbcodes verbieten
+            m_service_code_allowed = false;
+            
+            // rote LED blinken lassen   
+            led_timed(LED_R, LED_ERROR);
+            
+            alarmcheck_start();
+        }
+    }
+    else
+    {
+        LOG_DBG("Service-Farbcode nicht erlaubt");
+        // Farbcode korrekt
+        if(memcmp(m_colorcode, m_colorcode_eval, 6) == 0 || memcmp(m_sharecode, m_colorcode_eval, 6) == 0)
+        {
+            LOG_DBG("Normaler Farbcode korrekt");
+            
+            all_sounds_stop();
+            motor_1_start(true);
+            
+            // Falsche Eingaben des Farbcodes zurücksetzen
+            m_wrong_colorcode_attempts = 0;
+            k_timer_stop(&m_reset_wrong_colorcode_input_timer);
+            
+            if(memcmp(m_colorcode, m_colorcode_eval, 6) == 0)
+            {
+                // Neue Kopplung für eine gewisse Zeit erlauben, wenn Schloss geöffnet
+                m_bonding_allowed = true;
+                k_timer_start(&m_bond_allowed_timer, ONE_MIN_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
+
+                // Diebstahlmeldung entfernen, wenn sich ein Nutzer autorisiert hat
+                if((m_settings.theft_mode & THEFT_MODE_STOLEN) != 0)
+                {
+                    m_settings.theft_mode ^= THEFT_MODE_STOLEN;
+                    m_update_settings = true;
+                    gsm_send(CMD_STATUS_NOT_STOLEN);
+                }
+                else
+                {
+                    // GPS deaktivieren
+                    gps_off();
+                }
+            }
+        }
+        // Eingegebener Code falsch
+        else
+        {
+            LOG_DBG("Normaler Farbcode falsch");
+            // rote LED blinken lassen 
+            led_timed(LED_R, LED_ERROR);
+                           
+            // Anzahl der Fehleingaben erhöhen
+            m_wrong_colorcode_attempts++;
+            
+            // Wenn der Farbcode 5 mal falsch eingegeben wurde wird der Timer neugestartet
+            // Damit wird die Eingabe für 3 Minuten gesperrt
+            if(m_wrong_colorcode_attempts == 5)
+            {
+                m_colorcode_input_allowed = false;
+                k_timer_stop(&m_reset_wrong_colorcode_input_timer);
+            }
+            
+            // Timer zum Überwachen der Fehleingaben starten
+            k_timer_start(&m_reset_wrong_colorcode_input_timer, RESET_WRONG_COLORCODE_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
+            
+            alarmcheck_start();
+        }
+    }
+}
+
+K_WORK_DEFINE(work_colorcode_evaluate, work_colorcode_evaluate_handler);
+
+
 /**@brief Timeout zur Eingabe des Farbcodes
  *
  */
@@ -989,97 +1092,12 @@ void colorcode_input_timeout_handler(struct k_timer *timer)
      // Auswertung der Eingabe
     if(m_colorcode_in_index >= 6)
     {
-        LOG_DBG("Farbcode komplett");
-        k_timer_stop(&m_colorcode_input_timer);
-                    
-        // Werkszustand per Farbcode
-        if(m_service_code_allowed)
-        {
-            LOG_DBG("Service-Farbcode erlaubt");
-            // Timer zum Zurücksetzen des Flags anhalten
-            k_timer_stop(&m_service_code_reset_timer);
-            
-            if(memcmp(m_uicr_data.reset_code, m_colorcode_in, 6) == 0)
-            {
-                LOG_DBG("Service-Farbcode korrekt");
-                //Service-Farbcode eingegeben -> Werkszustand herstellen
-                all_sounds_stop();
-                motor_1_start(true);
-            }
-            // Eingegebener Code falsch
-            else
-            {
-                LOG_DBG("Service-Farbcode falsch");
-                // Erneute Eingabe des Service-Farbcodes verbieten
-                m_service_code_allowed = false;
-                
-                // rote LED blinken lassen   
-                led_timed(LED_R, LED_ERROR);
-                
-                alarmcheck_start();
-            }
-        }
-        else
-        {
-            LOG_DBG("Service-Farbcode nicht erlaubt");
-            // Farbcode korrekt
-            if(memcmp(m_colorcode, m_colorcode_in, 6) == 0 || memcmp(m_sharecode, m_colorcode_in, 6) == 0)
-            {
-                LOG_DBG("Normaler Farbcode korrekt");
-                
-                all_sounds_stop();
-                motor_1_start(true);
-                
-                // Falsche Eingaben des Farbcodes zurücksetzen
-                m_wrong_colorcode_attempts = 0;
-                k_timer_stop(&m_reset_wrong_colorcode_input_timer);
-                
-                if(memcmp(m_colorcode, m_colorcode_in, 6) == 0)
-                {
-                    // Neue Kopplung für eine gewisse Zeit erlauben, wenn Schloss geöffnet
-                    m_bonding_allowed = true;
-                    k_timer_start(&m_bond_allowed_timer, ONE_MIN_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
-
-                    // Diebstahlmeldung entfernen, wenn sich ein Nutzer autorisiert hat
-                    if((m_settings.theft_mode & THEFT_MODE_STOLEN) != 0)
-                    {
-                        m_settings.theft_mode ^= THEFT_MODE_STOLEN;
-                        m_update_settings = true;
-                        gsm_send(CMD_STATUS_NOT_STOLEN);
-                    }
-                    else
-                    {
-                        // GPS deaktivieren
-                        gps_off();
-                    }
-                }
-            }
-            // Eingegebener Code falsch
-            else
-            {
-                LOG_DBG("Normaler Farbcode falsch");
-                // rote LED blinken lassen 
-                led_timed(LED_R, LED_ERROR);
-                               
-                // Anzahl der Fehleingaben erhöhen
-                m_wrong_colorcode_attempts++;
-                
-                // Wenn der Farbcode 5 mal falsch eingegeben wurde wird der Timer neugestartet
-                // Damit wird die Eingabe für 3 Minuten gesperrt
-                if(m_wrong_colorcode_attempts == 5)
-                {
-                    m_colorcode_input_allowed = false;
-                    k_timer_stop(&m_reset_wrong_colorcode_input_timer);
-                }
-                
-                // Timer zum Überwachen der Fehleingaben starten
-                k_timer_start(&m_reset_wrong_colorcode_input_timer, RESET_WRONG_COLORCODE_TIMEOUT_INTERVAL, SINGLE_SHOT_TIMEOUT);
-                
-                alarmcheck_start();
-            }
-        }
-        
+        // Eingabe sofort beenden, damit ein Tastendruck vor der Auswertung
+        // nicht hinter das Ende von m_colorcode_in schreibt
+        memcpy(m_colorcode_eval, m_colorcode_in, 6);
         abort_colorcode_input();
+
+        k_work_submit(&work_colorcode_evaluate);
     }
 }
 
@@ -5901,7 +5919,7 @@ void do_button_action()
                 if(m_colorcode_input_allowed)
                 {
                     m_colorcode_in[m_colorcode_in_index] = m_selected_color;    
-                    m_selected_color = (++m_selected_color) % 4;
+                    m_selected_color = (m_selected_color + 1) % 4;
                     
                     LOG_DBG("m_colorcode_in[%d] = %d", m_colorcode_in_index, m_colorcode_in[m_colorcode_in_index]);
                     // Timer zur Überwachung der Eingabe starten
