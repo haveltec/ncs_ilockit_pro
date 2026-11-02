@@ -430,6 +430,7 @@ static bool                     m_dnd_mode_active = false;                      
 static bool                     m_restart_lock = false;                                     // Gibt an, ob das Schloss neugestartet werden soll
 static bool                     m_bootloader_prepare = false;                               // Flag, das angibt, ob der BL betreten werden soll
 static bool                     m_acc_check_passed = true;                                  // Flag, das angibt, ob der Selbsttest des Beschleunigungssensors erfolgreich war
+static uint8_t                  m_acc_check_result = ACC_NO_MOVEMENT;                       // Ergebnis der letzten Bewegungsprüfung vor dem Schließen (ACC_*)
 static bool                     m_chain_is_present = false;                                 // Flag, das angibt, ob die Einsteckkette im Schloss steckt oder nicht
 static bool                     m_charge_active = false;                                    // Flag, das angibt, ob das Schloss geladen wird
 static uint8_t                  m_batt_timeout_counter = 0;                                 // Zähler um den Batteriestand alle 24h zu messen
@@ -4559,7 +4560,8 @@ static void motor_1_start(bool direction_open)
         
         // Bewegungsprüfung durchführen (100 Samples * ~22ms ~= 2,2s Messzeit)
         uint8_t ret = accelerometer_check(100);
-        
+        m_acc_check_result = ret;
+
         if(ret == ACC_NO_MOVEMENT)
         {
             LOG_DBG("ACC_NO_MOVEMENT");
@@ -6825,14 +6827,30 @@ static void can_cmd_process(void)
         if(target)
             return;
 
+        m_acc_check_result = ACC_NO_MOVEMENT;
+
         motor_1_start(!lock);
 
-        // Beim Schliessen hat motor_1_start() Bewegung erkannt und abgebrochen
-        if(lock && !m_acc_check_passed &&
+        /*
+         * Beim Schliessen hat motor_1_start() den Motor gar nicht erst
+         * gestartet, weil die Bewegungspruefung angeschlagen hat. Der Grund
+         * steht in m_acc_check_result - m_acc_check_passed taugt dafuer nicht,
+         * es bleibt bei erkannter Bewegung true und wird nur bei gescheitertem
+         * Sensor-Selbsttest false.
+         */
+        if(lock && (m_acc_check_result != ACC_NO_MOVEMENT) &&
            ili_motorcontroller_get_motor_1_state() == MOTOR_STOP)
         {
-            LOG_WRN("CAN: Lock abgelehnt - Bewegung erkannt");
-            ili_can_bond_report_issue(ILI_CAN_ISSUE_LOCK_WHILE_MOVING);
+            if((m_acc_check_result & ACC_MOVEMENT) != 0)
+            {
+                LOG_WRN("CAN: Lock nicht gestartet - Bewegung erkannt");
+                ili_can_bond_report_issue(ILI_CAN_ISSUE_LOCK_WHILE_MOVING);
+            }
+            else
+            {
+                LOG_ERR("CAN: Lock nicht gestartet - Selbsttest des Beschleunigungssensors gescheitert");
+                ili_can_bond_report_issue(ILI_CAN_ISSUE_HARDWARE_FAILURE);
+            }
             return;
         }
 
