@@ -3,9 +3,10 @@
 
 // Firmware-Version
 #define FIRMWARE_MAJOR  50
-#define FIRMWARE_MINOR  53
+#define FIRMWARE_MINOR  55
 
 #define CLOSE_BY_USER_AFTER_BLOCKING
+#define DFU_WITHOUT_CHECK
 
 // Memory Layout
 // https://infocenter.nordicsemi.com/index.jsp?topic=%2Fsdk_nrf5_v17.1.0%2Flib_bootloader.html&anchor=lib_bootloader_memory

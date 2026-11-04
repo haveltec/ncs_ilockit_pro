@@ -6669,6 +6669,9 @@ enum mgmt_cb_return mcumgr_dfu_handler(uint32_t event, enum mgmt_cb_return prev_
         case MGMT_EVT_OP_IMG_MGMT_DFU_CHUNK:
         {
             LOG_DBG("MGMT_EVT_OP_IMG_MGMT_DFU_CHUNK");
+#ifdef DFU_WITHOUT_CHECK
+    m_dfu_started = true;
+#else            
             // Nur ein autorisierter Nutzer verbunden, Batteriestand über 50% und geöffnet
             if(authorised_user_connected() && m_peripheral_conn_count == 1 && ili_battery_get_value() > 50 
                 && m_current_locking_state_chain == STATUS_MOTOR_2_OPENED && m_current_locking_state == STATUS_MOTOR_1_OPENED)
@@ -6683,6 +6686,7 @@ enum mgmt_cb_return mcumgr_dfu_handler(uint32_t event, enum mgmt_cb_return prev_
                 *rc = MGMT_ERR_EACCESSDENIED;
                 return MGMT_CB_ERROR_ERR;
             }
+#endif
         }break;
 
         case MGMT_EVT_OP_OS_MGMT_RESET:
