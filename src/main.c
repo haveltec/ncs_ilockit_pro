@@ -207,6 +207,9 @@ static void advertising_stop();
 static void all_sounds_stop();                                      // Funktion zum Beenden des Alarmtons
 static void motor_1_start(bool direction_open);                     // Funktion zum Öffnen/Schließen des Schlosses
 static void motor_2_start(bool direction_open, bool force_locking); // Funktion zum Öffnen/Schließen der Kette
+static void can_start(void);                                        // CAN-Kommunikation mit dem eBike-System starten
+static void can_rx_handler(const uint8_t* p_data, void* p_user);    // Empfang vom eBike-System
+static void can_update_heartbeat(void);                             // Inhalt des CAN-Heartbeats aktualisieren
 static void alarmcheck_start();                                     // Alarmprüfung starten
 static void alarmcheck_stop(void);                                  // Alarmprüfung stoppen
 static void alarmsound_start(void);                                 // Funktion zum Abspielen des Alarmtons
@@ -6043,8 +6046,11 @@ static void evaluate_gpio_pins()
     if(is_pin_triggered(IRQ_CHARGE_STARTED))
     {
         LOG_DBG("IRQ_CHARGE_STARTED");
-        
+
         m_charge_active = true;
+
+        // Laderegler springt an = HPP-Spannung vom eBike-System liegt an
+        can_start();
 
         if(!m_bonding_mode_active && (m_needed_tests & TEST_GSM) == 0)
             led_faded(LED_R, LED_CHARGING);
@@ -6772,6 +6778,83 @@ static volatile uint8_t m_can_cmd_request = 0;     // ILI_CAN_CMD_LOCK/UNLOCK, 0
 static uint8_t          m_can_cmd_running = 0;     // Kommando, dessen Ergebnis noch aussteht
 static uint8_t          m_can_cmd_settle  = 0;
 
+/*
+ * Wann laeuft die CAN-Kommunikation?
+ *
+ * Das Schloss hat einen eigenen Akku und bleibt an, wenn das eBike-System
+ * abschaltet - eine Abschaltmeldung sieht die Spezifikation nicht vor, und
+ * unsere Heartbeats koennen ein ausgeschaltetes eBike-System wecken. Deshalb:
+ *
+ *   Start:  IRQ_CHARGE_STARTED - liegt die HPP-Spannung an, springt der
+ *           Laderegler an, auch bei vollem Akku kurz.
+ *   Stopp:  nach einem Lock-Kommando, sobald das Ergebnis feststeht
+ *           (verriegelt, oder Fehler per IssueInfo gemeldet). Das
+ *           eBike-System verriegelt beim Abschalten.
+ *
+ * Zwischen Ergebnis und Stopp liegt CAN_SLEEP_DELAY_MS, damit IssueInfo und
+ * ein Heartbeat mit dem endgueltigen LockState noch rausgehen.
+ */
+#define CAN_SLEEP_DELAY_MS      1000
+
+static bool    m_can_active   = false;
+static int64_t m_can_sleep_at = 0;                 // Zeitpunkt fuer den Stopp, 0 = keiner geplant
+
+
+/**@brief   Startet die CAN-Kommunikation mit dem eBike-System. */
+static void can_start(void)
+{
+    // Neue Spannung am HPP: ein geplanter Stopp ist hinfaellig
+    m_can_sleep_at = 0;
+
+    if(m_can_active)
+        return;
+
+    // Neue Sitzung - das eBike-System authentifiziert neu (12.2)
+    ili_can_auth_reset();
+    can_update_heartbeat();
+
+    int err = ili_can_elock_start(1, can_rx_handler, NULL);
+
+    if(err == 0 || err == -EALREADY)
+    {
+        m_can_active = true;
+        LOG_INF("CAN: Kommunikation gestartet (HPP-Spannung erkannt)");
+    }
+    else
+    {
+        LOG_ERR("CAN: Start fehlgeschlagen (err %d)", err);
+    }
+}
+
+
+/**@brief   Plant den Stopp nach einem abgeschlossenen Lock-Kommando. */
+static void can_schedule_sleep(void)
+{
+    m_can_sleep_at = k_uptime_get() + CAN_SLEEP_DELAY_MS;
+}
+
+
+/**@brief   Fuehrt einen geplanten Stopp aus (Main-Schleife). */
+static void can_sleep_process(void)
+{
+    if(m_can_sleep_at == 0 || k_uptime_get() < m_can_sleep_at)
+        return;
+
+    m_can_sleep_at = 0;
+
+    if(!m_can_active)
+        return;
+
+    // Nicht mitten in einem Kommando abschalten
+    if(m_can_cmd_request != 0 || m_can_cmd_running != 0)
+        return;
+
+    (void)ili_can_elock_stop();
+    m_can_active = false;
+
+    LOG_INF("CAN: Kommunikation beendet - Controller im Sleep");
+}
+
 
 /**@brief   LockState fuer den Heartbeat aus dem Zustand von Motor 1 (Buegel). */
 static ili_can_lock_state_t can_lock_state(void)
@@ -6829,7 +6912,11 @@ static void can_cmd_process(void)
 
         // Schon in der Zielstellung: nichts zu tun, der Heartbeat zeigt es bereits
         if(target)
+        {
+            if(lock)
+                can_schedule_sleep();
             return;
+        }
 
         m_acc_check_result = ACC_NO_MOVEMENT;
 
@@ -6855,6 +6942,8 @@ static void can_cmd_process(void)
                 LOG_ERR("CAN: Lock nicht gestartet - Selbsttest des Beschleunigungssensors gescheitert");
                 ili_can_bond_report_issue(ILI_CAN_ISSUE_HARDWARE_FAILURE);
             }
+
+            can_schedule_sleep();
             return;
         }
 
@@ -6898,6 +6987,10 @@ static void can_cmd_process(void)
     {
         LOG_INF("CAN: %s ausgefuehrt", lock ? "Lock" : "Unlock");
     }
+
+    // Nach dem Lock - egal ob verriegelt oder gescheitert - ist die Sitzung vorbei
+    if(lock)
+        can_schedule_sleep();
 }
 
 
@@ -7023,13 +7116,14 @@ int main(void)
     // Beschleunigungssensor initialisieren
     accelerometer_init(ILI_ACC_STK8321);
 
-    // CAN-Controller initialisieren und sofort in den Standby legen
+    // CAN-Controller initialisieren und sofort in den Standby legen. Gestartet
+    // wird erst mit IRQ_CHARGE_STARTED - liegt beim Booten schon Spannung am
+    // HPP an, setzt die Ladeerkennung weiter unten das Flag.
     ili_can_init();
     ili_can_auth_init();
     ili_can_bond_init();
     ili_can_bond_set_cmd_handler(can_cmd_handler);
     can_update_heartbeat();
-    ili_can_elock_start(1, can_rx_handler, NULL);
     
     ble_services_init();
 
@@ -7308,6 +7402,7 @@ TD("TODOs:");
         // Lock/Unlock vom eBike-System ausfuehren und den Heartbeat nachziehen
         can_cmd_process();
         can_update_heartbeat();
+        can_sleep_process();
 
         if(m_restart_lock)
         {
